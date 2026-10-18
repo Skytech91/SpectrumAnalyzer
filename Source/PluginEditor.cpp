@@ -209,9 +209,13 @@ void SpectrumAnalyzerEditor::resized()
 void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
 {
     const bool overPanel = settingsButton.getToggleState() && panelBounds.contains (e.getPosition());
+    const bool wasActive = hoverActive;
 
     hoverPos = e.position;
     hoverActive = getPlotBounds().contains (e.position) && ! overPanel;
+
+    if (hoverActive && ! wasActive)
+        lastReadoutX = -1.0f;
     setMouseCursor (hoverActive ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
 }
 
@@ -223,6 +227,7 @@ void SpectrumAnalyzerEditor::mouseDrag (const juce::MouseEvent& e)
 void SpectrumAnalyzerEditor::mouseExit (const juce::MouseEvent&)
 {
     hoverActive = false;
+    lastReadoutX = -1.0f;
     setMouseCursor (juce::MouseCursor::NormalCursor);
 }
 
@@ -248,6 +253,40 @@ void SpectrumAnalyzerEditor::timerCallback()
     const auto& settings = audioProcessor.settings;
     if (settings.animate.load() && settings.colourMode.load() == 1)
         hueOffset = std::fmod (hueOffset + 0.0025f, 1.0f);
+
+    // 5. caixinha de leitura: o nivel e suavizado e o texto so muda ~5 vezes por segundo
+    if (hoverActive)
+    {
+        const auto plot = getPlotBounds();
+        const int width = (int) plot.getWidth();
+
+        if (width >= 2)
+        {
+            const float x = juce::jlimit (plot.getX(), plot.getRight(), hoverPos.x);
+            const float t0 = (x - plot.getX()) / plot.getWidth();
+            const float t1 = t0 + 1.0f / (float) width;
+            const float ratio = maxFreq / minFreq;
+            const float f0 = minFreq * std::pow (ratio, t0);
+            const float f1 = minFreq * std::pow (ratio, t1);
+            const float binHz = (float) (audioProcessor.getCurrentSampleRate() / (double) fftSize);
+            const float level = levelBetween (f0, f1, binHz);
+
+            const bool moved = std::abs (x - lastReadoutX) > 0.5f;
+            lastReadoutX = x;
+
+            if (moved)
+                readoutLevel = level;                             // rato mexeu: responde logo
+            else
+                readoutLevel += (level - readoutLevel) * 0.1f;    // rato parado: valor estavel
+
+            if (moved || ++readoutTick >= 6)
+            {
+                readoutTick = 0;
+                readoutLine1 = frequencyText (f0) + "   " + noteName (f0);
+                readoutLine2 = juce::String (readoutLevel, 1) + " dB";
+            }
+        }
+    }
 
     repaint();
 }
@@ -416,24 +455,22 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         const float t1 = t0 + 1.0f / (float) width;
         const float f0 = minFreq * std::pow (ratio, t0);
         const float f1 = minFreq * std::pow (ratio, t1);
-        const float level = levelBetween (f0, f1, binHz);
-        const float y = yForDb (level);
+        const float y = yForDb (levelBetween (f0, f1, binHz));
 
+        // linha vertical e ponto na curva
         g.setColour (juce::Colours::white.withAlpha (0.3f));
         g.drawVerticalLine ((int) x, plot.getY(), plot.getBottom());
         g.setColour (juce::Colours::white);
         g.fillEllipse (x - 3.5f, y - 3.5f, 7.0f, 7.0f);
 
-        const juce::String line1 = frequencyText (f0) + "   " + noteName (f0);
-        const juce::String line2 = juce::String (level, 1) + " dB";
-
+        // caixinha: segue o rato (e nao a curva), por isso nao salta
         juce::Rectangle<float> box (0.0f, 0.0f, 134.0f, 40.0f);
-        float bx = x + 14.0f;
+        float bx = hoverPos.x + 16.0f;
         if (bx + box.getWidth() > plot.getRight())
-            bx = x - 14.0f - box.getWidth();
-        float by = y - box.getHeight() - 10.0f;
+            bx = hoverPos.x - 16.0f - box.getWidth();
+        float by = hoverPos.y - box.getHeight() - 12.0f;
         if (by < plot.getY())
-            by = y + 12.0f;
+            by = hoverPos.y + 18.0f;
         box.setPosition (bx, by);
 
         g.setColour (juce::Colour (0xee1a2027));
@@ -444,9 +481,9 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         auto inner = box.toNearestInt().reduced (9, 5);
         g.setFont (12.0f);
         g.setColour (juce::Colours::white);
-        g.drawText (line1, inner.removeFromTop (16), juce::Justification::centredLeft);
+        g.drawText (readoutLine1, inner.removeFromTop (16), juce::Justification::centredLeft);
         g.setColour (juce::Colours::white.withAlpha (0.7f));
-        g.drawText (line2, inner, juce::Justification::centredLeft);
+        g.drawText (readoutLine2, inner, juce::Justification::centredLeft);
     }
 
     // painel de definicoes (fundo e textos; os controlos desenham-se por cima)

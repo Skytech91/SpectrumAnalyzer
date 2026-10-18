@@ -126,5 +126,11 @@ private:
     juce::Point<float> hoverPos;
     bool hoverActive = false;
 
+    // texto da caixinha de leitura (estabilizado para nao tremer)
+    juce::String readoutLine1, readoutLine2;
+    float readoutLevel = -90.0f;
+    float lastReadoutX = -1.0f;
+    int readoutTick = 0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumAnalyzerEditor)
 };
