@@ -51,6 +51,10 @@ public:
         std::atomic<float>    lineThickness { 1.6f };
         std::atomic<int>      background    { 0 };            // 0..3
         std::atomic<bool>     animate       { false };
+        std::atomic<bool>     peakHold      { false };
+        std::atomic<int>      tilt          { 0 };            // 0 = flat, 1 = 3 dB/oct, 2 = 4.5 dB/oct
+        std::atomic<int>      speed         { 1 };            // 0 = fast, 1 = medium, 2 = slow
+        std::atomic<int>      range         { 1 };            // 0 = 60 dB, 1 = 90 dB, 2 = 120 dB
     } settings;
 
 private:

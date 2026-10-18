@@ -67,6 +67,10 @@ void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData
     xml.setAttribute ("lineThickness", (double) settings.lineThickness.load());
     xml.setAttribute ("background",    settings.background.load());
     xml.setAttribute ("animate",       settings.animate.load() ? 1 : 0);
+    xml.setAttribute ("peakHold",      settings.peakHold.load() ? 1 : 0);
+    xml.setAttribute ("tilt",          settings.tilt.load());
+    xml.setAttribute ("speed",         settings.speed.load());
+    xml.setAttribute ("range",         settings.range.load());
     copyXmlToBinary (xml, destData);
 }
 
@@ -82,6 +86,10 @@ void SpectrumAnalyzerProcessor::setStateInformation (const void* data, int sizeI
             settings.lineThickness = (float) xml->getDoubleAttribute ("lineThickness", 1.6);
             settings.background    = xml->getIntAttribute ("background", 0);
             settings.animate       = xml->getIntAttribute ("animate", 0) != 0;
+            settings.peakHold      = xml->getIntAttribute ("peakHold", 0) != 0;
+            settings.tilt          = xml->getIntAttribute ("tilt", 0);
+            settings.speed         = xml->getIntAttribute ("speed", 1);
+            settings.range         = xml->getIntAttribute ("range", 1);
         }
     }
 }
