@@ -141,6 +141,7 @@ public:
     void mouseMove (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseExit (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
 
 private:
     static constexpr int maxFftSize = SpectrumAnalyzerProcessor::maxFftSize;
@@ -152,7 +153,7 @@ private:
     void updateSpectrum (const float* samples, Spectrum& smoothedOut, Spectrum& peaksOut,
                          float attack, float release, bool peaksOn);
     float levelAt (const Spectrum& data, float f0, float f1, float binHz) const;
-    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha, bool secondary = false) const;
+    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const;
     juce::Rectangle<float> getPlotBounds() const;
     void updateSwatchSelection();
     void setPanelVisible (bool shouldBeVisible);
@@ -176,12 +177,16 @@ private:
     // settings panel
     GearButton settingsButton;
     juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox, channelsBox, fftBox;
-    SwatchRow swatches;
+    SwatchRow swatches, swatchesB;
     juce::Slider hueSlider, thicknessSlider;
     juce::ToggleButton animateToggle, peakToggle;
     juce::Rectangle<int> panelBounds;
-    std::array<juce::Rectangle<int>, 10> labelRects;
-    std::array<juce::String, 10> labelTexts;
+    std::array<juce::Rectangle<int>, 11> labelRects;
+    std::array<juce::String, 11> labelTexts;
+
+    // legend (two-curve modes): click a name to hide / show that curve
+    juce::Rectangle<int> legendA, legendB;
+    bool showA = true, showB = true;
 
     float hueOffset = 0.0f;
 

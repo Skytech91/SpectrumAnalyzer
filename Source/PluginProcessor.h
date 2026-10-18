@@ -48,6 +48,7 @@ public:
     {
         std::atomic<int>      colourMode    { 0 };            // 0 = single colour, 1 = rainbow
         std::atomic<uint32_t> singleColour  { 0xff35e0c2 };
+        std::atomic<uint32_t> colourB       { 0xffff4fb8 };   // colour of curve B (right / side)
         std::atomic<int>      fillStyle     { 0 };            // 0 = gradient, 1 = solid, 2 = line only
         std::atomic<float>    lineThickness { 1.6f };
         std::atomic<int>      background    { 0 };            // 0..3

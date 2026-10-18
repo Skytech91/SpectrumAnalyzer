@@ -67,6 +67,7 @@ void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData
     juce::XmlElement xml ("MugenSpectrumSettings");
     xml.setAttribute ("colourMode",    settings.colourMode.load());
     xml.setAttribute ("singleColour",  juce::Colour (settings.singleColour.load()).toString());
+    xml.setAttribute ("colourB",       juce::Colour (settings.colourB.load()).toString());
     xml.setAttribute ("fillStyle",     settings.fillStyle.load());
     xml.setAttribute ("lineThickness", (double) settings.lineThickness.load());
     xml.setAttribute ("background",    settings.background.load());
@@ -88,6 +89,7 @@ void SpectrumAnalyzerProcessor::setStateInformation (const void* data, int sizeI
         {
             settings.colourMode    = xml->getIntAttribute ("colourMode", 0);
             settings.singleColour  = juce::Colour::fromString (xml->getStringAttribute ("singleColour", "ff35e0c2")).getARGB();
+            settings.colourB       = juce::Colour::fromString (xml->getStringAttribute ("colourB", "ffff4fb8")).getARGB();
             settings.fillStyle     = xml->getIntAttribute ("fillStyle", 0);
             settings.lineThickness = (float) xml->getDoubleAttribute ("lineThickness", 1.6);
             settings.background    = xml->getIntAttribute ("background", 0);

@@ -47,8 +47,8 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     rebuildFft (2048 << juce::jlimit (0, 3, s.fftSizeIndex.load()));
     lastStereoMode = juce::jlimit (0, 2, s.stereoMode.load());
 
-    labelTexts = { juce::String ("Color mode"), juce::String ("Color"), juce::String ("Fill"),
-                   juce::String ("Line thickness"), juce::String ("Background"),
+    labelTexts = { juce::String ("Color mode"), juce::String ("Color"), juce::String ("Color B (R / Side)"),
+                   juce::String ("Fill"), juce::String ("Line thickness"), juce::String ("Background"),
                    juce::String ("Tilt"), juce::String ("Speed"), juce::String ("Range"),
                    juce::String ("Channels"), juce::String ("FFT size") };
 
@@ -76,6 +76,11 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
         modeBox.setSelectedId (1, juce::sendNotification);
     };
     addChildComponent (swatches);
+
+    // colour of the second curve (right / side) in the two-curve modes
+    swatchesB.setSelectedFromColour (juce::Colour (s.colourB.load()));
+    swatchesB.onPick = [this] (juce::Colour c) { audioProcessor.settings.colourB = c.getARGB(); };
+    addChildComponent (swatchesB);
 
     // any colour, using hue (the rainbow bar is drawn behind the slider)
     hueSlider.setSliderStyle (juce::Slider::LinearHorizontal);
@@ -181,8 +186,8 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     setPanelVisible (false);
 
     setResizable (true, true);
-    setResizeLimits (580, 380, 1600, 900);
-    setSize (780, 440);
+    setResizeLimits (580, 400, 1600, 900);
+    setSize (780, 460);
 
     startTimerHz (30);   // refresh 30 times per second
 }
@@ -226,7 +231,7 @@ void SpectrumAnalyzerEditor::updateSwatchSelection()
 
 void SpectrumAnalyzerEditor::setPanelVisible (bool shouldBeVisible)
 {
-    const std::array<juce::Component*, 13> controls = { &modeBox, &swatches, &hueSlider, &animateToggle,
+    const std::array<juce::Component*, 14> controls = { &modeBox, &swatches, &swatchesB, &hueSlider, &animateToggle,
                                                        &fillBox, &thicknessSlider, &backgroundBox,
                                                        &peakToggle, &tiltBox, &speedBox, &rangeBox,
                                                        &channelsBox, &fftBox };
@@ -250,7 +255,10 @@ void SpectrumAnalyzerEditor::resized()
 {
     settingsButton.setBounds (getWidth() - 116, 4, 106, 26);
 
-    panelBounds = juce::Rectangle<int> (getWidth() - 530, 38, 520, 306);
+    legendA = juce::Rectangle<int> (getWidth() - 116 - 190, 5, 84, 24);
+    legendB = juce::Rectangle<int> (getWidth() - 116 - 100, 5, 92, 24);
+
+    panelBounds = juce::Rectangle<int> (getWidth() - 530, 38, 520, 350);
     auto inner = panelBounds.reduced (14, 12);
     auto left = inner.removeFromLeft (236);
     inner.removeFromLeft (20);
@@ -271,6 +279,10 @@ void SpectrumAnalyzerEditor::resized()
     swatches.setBounds (left.removeFromTop (24));
     left.removeFromTop (2);
     hueSlider.setBounds (left.removeFromTop (18));
+    left.removeFromTop (8);
+
+    nextLabel (left);                               // Color B
+    swatchesB.setBounds (left.removeFromTop (24));
     left.removeFromTop (8);
 
     animateToggle.setBounds (left.removeFromTop (24));
@@ -322,7 +334,23 @@ void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
     if (hoverActive && ! wasActive)
         lastReadoutX = -1.0f;
 
-    setMouseCursor (hoverActive ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
+    const bool overLegend = audioProcessor.settings.stereoMode.load() != 0
+                            && (legendA.contains (e.getPosition()) || legendB.contains (e.getPosition()));
+
+    setMouseCursor (overLegend ? juce::MouseCursor::PointingHandCursor
+                               : (hoverActive ? juce::MouseCursor::CrosshairCursor
+                                              : juce::MouseCursor::NormalCursor));
+}
+
+void SpectrumAnalyzerEditor::mouseDown (const juce::MouseEvent& e)
+{
+    if (audioProcessor.settings.stereoMode.load() == 0)
+        return;
+
+    if (legendA.contains (e.getPosition()))
+        showA = ! showA;
+    else if (legendB.contains (e.getPosition()))
+        showB = ! showB;
 }
 
 void SpectrumAnalyzerEditor::mouseDrag (const juce::MouseEvent& e)
@@ -493,24 +521,19 @@ float SpectrumAnalyzerEditor::levelAt (const Spectrum& data, float f0, float f1,
     return m + tilt * std::log2 (std::sqrt (f0 * f1) / 1000.0f);
 }
 
-// Colour of the curve along the frequency axis (left -> right).
-// "secondary" is the colour of curve B (the opposite colour of curve A).
-juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> plot, float alpha,
-                                                                     bool secondary) const
+// Colour of the curve along the frequency axis (left -> right), for the Mix mode
+juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const
 {
     const auto& s = audioProcessor.settings;
 
     if (s.colourMode.load() == 0)
     {
-        auto c = juce::Colour (s.singleColour.load());
-        if (secondary)
-            c = c.withRotatedHue (0.5f);
-        c = c.withAlpha (alpha);
+        const auto c = juce::Colour (s.singleColour.load()).withAlpha (alpha);
         return juce::ColourGradient (c, plot.getX(), 0.0f, c, plot.getRight(), 0.0f, false);
     }
 
     const int stops = 12;
-    const float offset = hueOffset + (secondary ? 0.5f : 0.0f);
+    const float offset = hueOffset;
     auto colourAt = [offset, alpha] (float t)
     {
         return juce::Colour::fromHSV (std::fmod (offset + 0.8f * t, 1.0f), 0.7f, 1.0f, alpha);
@@ -533,36 +556,32 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
     const auto plot = getPlotBounds();
     const auto header = getLocalBounds().toFloat().removeFromTop (32.0f);
     const int mode = juce::jlimit (0, 2, s.stereoMode.load());
+    const bool stereo = (mode != 0);
+
+    // in the two-curve modes both curves use two fixed, clearly different colours
+    const auto colourA = juce::Colour (s.singleColour.load());
+    const auto colourB = juce::Colour (s.colourB.load());
 
     // signature
     g.setColour (juce::Colours::white.withAlpha (0.85f));
     g.setFont (14.0f);
     g.drawText ("Made by Mugen", header.toNearestInt().withTrimmedLeft (14), juce::Justification::centredLeft);
 
-    // legend for two-curve modes: solid line = A, dashed line = B
-    if (mode != 0)
+    // legend (two-curve modes): click a name to hide / show that curve
+    if (stereo)
     {
-        const bool single = s.colourMode.load() == 0;
-        const auto colourA = single ? juce::Colour (s.singleColour.load()) : juce::Colours::white;
-        const auto colourB = single ? colourA.withRotatedHue (0.5f) : juce::Colours::white;
-        const juce::String nameA = (mode == 1) ? "L" : "Mid";
-        const juce::String nameB = (mode == 1) ? "R" : "Side";
+        auto drawLegend = [&] (juce::Rectangle<int> r, juce::Colour c, const juce::String& name, bool visible)
+        {
+            const float ly = (float) r.getCentreY();
+            g.setColour (c.withAlpha (visible ? 1.0f : 0.25f));
+            g.drawLine ((float) r.getX() + 4.0f, ly, (float) r.getX() + 22.0f, ly, 2.5f);
+            g.setColour (juce::Colours::white.withAlpha (visible ? 0.85f : 0.3f));
+            g.setFont (12.0f);
+            g.drawText (name, r.withTrimmedLeft (28), juce::Justification::centredLeft);
+        };
 
-        const float ly = header.getCentreY();
-        float lx = (float) getWidth() - 116.0f - 150.0f;
-
-        g.setColour (colourA);
-        g.drawLine (lx, ly, lx + 18.0f, ly, 2.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.8f));
-        g.setFont (12.0f);
-        g.drawText (nameA, juce::Rectangle<int> ((int) lx + 22, (int) ly - 8, 34, 16), juce::Justification::centredLeft);
-
-        lx += 66.0f;
-        g.setColour (colourB);
-        for (int k = 0; k < 3; ++k)
-            g.drawLine (lx + (float) k * 7.0f, ly, lx + (float) k * 7.0f + 4.0f, ly, 2.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.8f));
-        g.drawText (nameB, juce::Rectangle<int> ((int) lx + 24, (int) ly - 8, 40, 16), juce::Justification::centredLeft);
+        drawLegend (legendA, colourA, (mode == 1) ? "L" : "Mid", showA);
+        drawLegend (legendB, colourB, (mode == 1) ? "R" : "Side", showB);
     }
 
     const float displayMinDb = rangeTable[juce::jlimit (0, 2, s.range.load())];
@@ -611,41 +630,50 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
     if (width >= 2)
     {
         curveA = buildCurve (smoothedA);
-        const auto filledA = closeUnder (curveA);
+        if (stereo)
+            curveB = buildCurve (smoothedB);
 
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
 
         const int fillStyle = s.fillStyle.load();
 
-        // curve B: soft fill underneath
-        if (mode != 0)
+        if (stereo)
         {
-            curveB = buildCurve (smoothedB);
-
+            // two curves: soft vertical fades, so the overlap stays readable
             if (fillStyle != 2)
             {
-                g.setGradientFill (makeHorizontalGradient (plot, 0.2f, true));
-                g.fillPath (closeUnder (curveB));
+                auto fadeFill = [&] (const juce::Path& curve, juce::Colour c, float topAlpha)
+                {
+                    g.setGradientFill (juce::ColourGradient (c.withAlpha (topAlpha), 0.0f, plot.getY(),
+                                                             c.withAlpha (0.0f), 0.0f, plot.getBottom(), false));
+                    g.fillPath (closeUnder (curve));
+                };
+
+                if (showB) fadeFill (curveB, colourB, 0.45f);
+                if (showA) fadeFill (curveA, colourA, 0.55f);
             }
         }
-
-        // curve A: fill under the curve
-        if (fillStyle == 0)          // gradient: strong colour on top, fades into the background
+        else
         {
-            g.setGradientFill (makeHorizontalGradient (plot, 0.75f));
-            g.fillPath (filledA);
+            const auto filledA = closeUnder (curveA);
 
-            juce::Graphics::ScopedSaveState inner (g);
-            g.reduceClipRegion (filledA, juce::AffineTransform());
-            g.setGradientFill (juce::ColourGradient (bg.withAlpha (0.0f), 0.0f, plot.getY(),
-                                                     bg.withAlpha (0.96f), 0.0f, plot.getBottom(), false));
-            g.fillRect (plot);
-        }
-        else if (fillStyle == 1)     // solid
-        {
-            g.setGradientFill (makeHorizontalGradient (plot, 0.35f));
-            g.fillPath (filledA);
+            if (fillStyle == 0)          // gradient: strong colour on top, fades into the background
+            {
+                g.setGradientFill (makeHorizontalGradient (plot, 0.75f));
+                g.fillPath (filledA);
+
+                juce::Graphics::ScopedSaveState inner (g);
+                g.reduceClipRegion (filledA, juce::AffineTransform());
+                g.setGradientFill (juce::ColourGradient (bg.withAlpha (0.0f), 0.0f, plot.getY(),
+                                                         bg.withAlpha (0.96f), 0.0f, plot.getBottom(), false));
+                g.fillRect (plot);
+            }
+            else if (fillStyle == 1)     // solid
+            {
+                g.setGradientFill (makeHorizontalGradient (plot, 0.35f));
+                g.fillPath (filledA);
+            }
         }
     }
 
@@ -674,38 +702,41 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
                     juce::Justification::centredRight);
     }
 
-    // curve lines: A solid, B dashed
+    // curve lines (both solid; in the two-curve modes each has its own colour)
     if (width >= 2)
     {
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
 
-        g.setGradientFill (makeHorizontalGradient (plot, 1.0f));
-        g.strokePath (curveA, juce::PathStrokeType (s.lineThickness.load()));
+        const juce::PathStrokeType stroke (s.lineThickness.load());
 
-        if (mode != 0)
+        if (! stereo)
         {
-            const float dashes[] = { 5.0f, 3.0f };
-            juce::Path dashed;
-            juce::PathStrokeType (s.lineThickness.load()).createDashedStroke (dashed, curveB, dashes, 2);
-            g.setGradientFill (makeHorizontalGradient (plot, 1.0f, true));
-            g.fillPath (dashed);
+            g.setGradientFill (makeHorizontalGradient (plot, 1.0f));
+            g.strokePath (curveA, stroke);
+        }
+        else
+        {
+            if (showB) { g.setColour (colourB); g.strokePath (curveB, stroke); }
+            if (showA) { g.setColour (colourA); g.strokePath (curveA, stroke); }
         }
     }
 
-    // peak hold lines
+    // peak hold lines (in the two-curve modes: in the colour of each curve)
     if (width >= 2 && s.peakHold.load())
     {
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
 
-        g.setColour (juce::Colours::white.withAlpha (0.55f));
-        g.strokePath (buildCurve (peaksA), juce::PathStrokeType (1.0f));
-
-        if (mode != 0)
+        if (! stereo)
         {
-            g.setColour (juce::Colours::white.withAlpha (0.35f));
-            g.strokePath (buildCurve (peaksB), juce::PathStrokeType (1.0f));
+            g.setColour (juce::Colours::white.withAlpha (0.55f));
+            g.strokePath (buildCurve (peaksA), juce::PathStrokeType (1.0f));
+        }
+        else
+        {
+            if (showB) { g.setColour (colourB.withAlpha (0.6f)); g.strokePath (buildCurve (peaksB), juce::PathStrokeType (1.0f)); }
+            if (showA) { g.setColour (colourA.withAlpha (0.6f)); g.strokePath (buildCurve (peaksA), juce::PathStrokeType (1.0f)); }
         }
     }
 
@@ -722,18 +753,22 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         // vertical line and dot(s) on the curve(s)
         g.setColour (juce::Colours::white.withAlpha (0.3f));
         g.drawVerticalLine ((int) x, plot.getY(), plot.getBottom());
-        g.setColour (juce::Colours::white);
-        g.fillEllipse (x - 3.5f, yA - 3.5f, 7.0f, 7.0f);
 
-        if (mode != 0)
+        if (! stereo || showA)
+        {
+            g.setColour (stereo ? colourA : juce::Colours::white);
+            g.fillEllipse (x - 3.5f, yA - 3.5f, 7.0f, 7.0f);
+        }
+
+        if (stereo && showB)
         {
             const float yB = juce::jlimit (plot.getY(), plot.getBottom(), yForDb (levelAt (smoothedB, f0, f1, binHz)));
-            g.setColour (juce::Colours::white.withAlpha (0.6f));
-            g.fillEllipse (x - 3.0f, yB - 3.0f, 6.0f, 6.0f);
+            g.setColour (colourB);
+            g.fillEllipse (x - 3.5f, yB - 3.5f, 7.0f, 7.0f);
         }
 
         // box follows the mouse (not the curve), so it does not jump
-        juce::Rectangle<float> box (0.0f, 0.0f, mode != 0 ? 210.0f : 134.0f, 40.0f);
+        juce::Rectangle<float> box (0.0f, 0.0f, stereo ? 210.0f : 134.0f, 40.0f);
         float bx = hoverPos.x + 16.0f;
         if (bx + box.getWidth() > plot.getRight())
             bx = hoverPos.x - 16.0f - box.getWidth();
@@ -771,7 +806,13 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         g.setColour (juce::Colours::white.withAlpha (0.7f));
         g.setFont (12.0f);
         for (size_t i = 0; i < labelRects.size(); ++i)
-            g.drawText (labelTexts[i], labelRects[i], juce::Justification::centredLeft);
+        {
+            juce::String text = labelTexts[i];
+            if (i == 0 && stereo && s.colourMode.load() == 1)
+                text = "Color mode (rainbow: Mix only)";
+
+            g.drawText (text, labelRects[i], juce::Justification::centredLeft);
+        }
 
         // rainbow bar behind the hue slider
         const auto bar = hueSlider.getBounds().toFloat()
