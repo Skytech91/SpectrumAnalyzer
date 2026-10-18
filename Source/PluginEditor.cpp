@@ -16,6 +16,23 @@ namespace
                                          juce::Colour (0xff000000),   // preto
                                          juce::Colour (0xff0b1226),   // azul-noite
                                          juce::Colour (0xff170f26) }; // roxo escuro
+
+    juce::String frequencyText (float f)
+    {
+        if (f >= 1000.0f) return juce::String (f / 1000.0f, 2) + " kHz";
+        if (f >= 100.0f)  return juce::String ((int) std::lround (f)) + " Hz";
+        return juce::String (f, 1) + " Hz";
+    }
+
+    // nome da nota musical mais proxima (A4 = 440 Hz)
+    juce::String noteName (float freq)
+    {
+        static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+        const int midi = (int) std::lround (69.0 + 12.0 * std::log2 ((double) freq / 440.0));
+        const int index = ((midi % 12) + 12) % 12;
+        const int octave = midi / 12 - 1;
+        return juce::String (names[index]) + juce::String (octave);
+    }
 }
 
 SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
@@ -40,11 +57,15 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     modeBox.addItem (pt ("Cor " "\xc3\xba" "nica"), 1);
     modeBox.addItem (pt ("Arco-" "\xc3\xad" "ris"), 2);
     modeBox.setSelectedId (s.colourMode.load() + 1, juce::dontSendNotification);
-    modeBox.onChange = [this] { audioProcessor.settings.colourMode = modeBox.getSelectedId() - 1; };
+    modeBox.onChange = [this]
+    {
+        audioProcessor.settings.colourMode = modeBox.getSelectedId() - 1;
+        updateSwatchSelection();
+    };
     addChildComponent (modeBox);
 
     // cores para escolher
-    swatches.setSelectedFromColour (juce::Colour (s.singleColour.load()));
+    updateSwatchSelection();
     swatches.onPick = [this] (juce::Colour c)
     {
         audioProcessor.settings.singleColour = c.getARGB();
@@ -53,10 +74,13 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     };
     addChildComponent (swatches);
 
-    // qualquer cor, pelo "matiz"
+    // qualquer cor, pelo "matiz" (a barra de arco-iris e desenhada por tras)
     hueSlider.setSliderStyle (juce::Slider::LinearHorizontal);
     hueSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     hueSlider.setRange (0.0, 1.0, 0.001);
+    hueSlider.setColour (juce::Slider::backgroundColourId, juce::Colours::transparentBlack);
+    hueSlider.setColour (juce::Slider::trackColourId, juce::Colours::transparentBlack);
+    hueSlider.setColour (juce::Slider::thumbColourId, juce::Colours::white);
     hueSlider.setValue ((double) juce::Colour (s.singleColour.load()).getHue(), juce::dontSendNotification);
     hueSlider.onValueChange = [this]
     {
@@ -81,10 +105,13 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     fillBox.onChange = [this] { audioProcessor.settings.fillStyle = fillBox.getSelectedId() - 1; };
     addChildComponent (fillBox);
 
-    // espessura da linha
+    // espessura da linha (barra bem visivel)
     thicknessSlider.setSliderStyle (juce::Slider::LinearHorizontal);
     thicknessSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     thicknessSlider.setRange (0.5, 4.0, 0.1);
+    thicknessSlider.setColour (juce::Slider::backgroundColourId, juce::Colours::white.withAlpha (0.25f));
+    thicknessSlider.setColour (juce::Slider::trackColourId, juce::Colours::white.withAlpha (0.85f));
+    thicknessSlider.setColour (juce::Slider::thumbColourId, juce::Colours::white);
     thicknessSlider.setValue ((double) s.lineThickness.load(), juce::dontSendNotification);
     thicknessSlider.onValueChange = [this]
     {
@@ -115,6 +142,15 @@ SpectrumAnalyzerEditor::~SpectrumAnalyzerEditor()
     stopTimer();
 }
 
+// Em modo arco-iris nenhuma bolinha fica marcada
+void SpectrumAnalyzerEditor::updateSwatchSelection()
+{
+    if (audioProcessor.settings.colourMode.load() == 1)
+        swatches.clearSelection();
+    else
+        swatches.setSelectedFromColour (juce::Colour (audioProcessor.settings.singleColour.load()));
+}
+
 void SpectrumAnalyzerEditor::setPanelVisible (bool shouldBeVisible)
 {
     const std::array<juce::Component*, 7> controls = { &modeBox, &swatches, &hueSlider, &animateToggle,
@@ -123,6 +159,16 @@ void SpectrumAnalyzerEditor::setPanelVisible (bool shouldBeVisible)
         c->setVisible (shouldBeVisible);
 
     repaint();
+}
+
+juce::Rectangle<float> SpectrumAnalyzerEditor::getPlotBounds() const
+{
+    auto bounds = getLocalBounds().toFloat();
+    bounds.removeFromTop (32.0f);
+    auto plot = bounds.reduced (10.0f);
+    plot.removeFromLeft (30.0f);
+    plot.removeFromBottom (18.0f);
+    return plot;
 }
 
 void SpectrumAnalyzerEditor::resized()
@@ -158,6 +204,26 @@ void SpectrumAnalyzerEditor::resized()
 
     nextLabel();                                   // Fundo
     backgroundBox.setBounds (r.removeFromTop (24));
+}
+
+void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
+{
+    const bool overPanel = settingsButton.getToggleState() && panelBounds.contains (e.getPosition());
+
+    hoverPos = e.position;
+    hoverActive = getPlotBounds().contains (e.position) && ! overPanel;
+    setMouseCursor (hoverActive ? juce::MouseCursor::CrosshairCursor : juce::MouseCursor::NormalCursor);
+}
+
+void SpectrumAnalyzerEditor::mouseDrag (const juce::MouseEvent& e)
+{
+    mouseMove (e);
+}
+
+void SpectrumAnalyzerEditor::mouseExit (const juce::MouseEvent&)
+{
+    hoverActive = false;
+    setMouseCursor (juce::MouseCursor::NormalCursor);
 }
 
 void SpectrumAnalyzerEditor::timerCallback()
@@ -242,11 +308,8 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
     const auto bg = backgrounds[juce::jlimit (0, 3, s.background.load())];
     g.fillAll (bg);
 
-    auto bounds = getLocalBounds().toFloat();
-    auto header = bounds.removeFromTop (32.0f);
-    auto plot = bounds.reduced (10.0f);
-    plot.removeFromLeft (30.0f);
-    plot.removeFromBottom (18.0f);
+    const auto plot = getPlotBounds();
+    const auto header = getLocalBounds().toFloat().removeFromTop (32.0f);
 
     // assinatura
     g.setColour (juce::Colours::white.withAlpha (0.85f));
@@ -262,15 +325,15 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         return plot.getBottom() - plot.getHeight() * (db - minDb) / (maxDb - minDb);
     };
 
-    // curva do espetro
     const int width = (int) plot.getWidth();
+    const float binHz = (float) (audioProcessor.getCurrentSampleRate() / (double) fftSize);
+    const float ratio = maxFreq / minFreq;
+
+    // curva do espetro
     juce::Path curve, filled;
 
     if (width >= 2)
     {
-        const float binHz = (float) (audioProcessor.getCurrentSampleRate() / (double) fftSize);
-        const float ratio = maxFreq / minFreq;
-
         for (int px = 0; px <= width; ++px)
         {
             const float f0 = minFreq * std::pow (ratio, (float) px / (float) width);
@@ -345,6 +408,47 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         g.strokePath (curve, juce::PathStrokeType (s.lineThickness.load()));
     }
 
+    // leitura ao passar o rato: frequencia, nota e nivel
+    if (hoverActive && width >= 2)
+    {
+        const float x = juce::jlimit (plot.getX(), plot.getRight(), hoverPos.x);
+        const float t0 = (x - plot.getX()) / plot.getWidth();
+        const float t1 = t0 + 1.0f / (float) width;
+        const float f0 = minFreq * std::pow (ratio, t0);
+        const float f1 = minFreq * std::pow (ratio, t1);
+        const float level = levelBetween (f0, f1, binHz);
+        const float y = yForDb (level);
+
+        g.setColour (juce::Colours::white.withAlpha (0.3f));
+        g.drawVerticalLine ((int) x, plot.getY(), plot.getBottom());
+        g.setColour (juce::Colours::white);
+        g.fillEllipse (x - 3.5f, y - 3.5f, 7.0f, 7.0f);
+
+        const juce::String line1 = frequencyText (f0) + "   " + noteName (f0);
+        const juce::String line2 = juce::String (level, 1) + " dB";
+
+        juce::Rectangle<float> box (0.0f, 0.0f, 134.0f, 40.0f);
+        float bx = x + 14.0f;
+        if (bx + box.getWidth() > plot.getRight())
+            bx = x - 14.0f - box.getWidth();
+        float by = y - box.getHeight() - 10.0f;
+        if (by < plot.getY())
+            by = y + 12.0f;
+        box.setPosition (bx, by);
+
+        g.setColour (juce::Colour (0xee1a2027));
+        g.fillRoundedRectangle (box, 6.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.18f));
+        g.drawRoundedRectangle (box, 6.0f, 1.0f);
+
+        auto inner = box.toNearestInt().reduced (9, 5);
+        g.setFont (12.0f);
+        g.setColour (juce::Colours::white);
+        g.drawText (line1, inner.removeFromTop (16), juce::Justification::centredLeft);
+        g.setColour (juce::Colours::white.withAlpha (0.7f));
+        g.drawText (line2, inner, juce::Justification::centredLeft);
+    }
+
     // painel de definicoes (fundo e textos; os controlos desenham-se por cima)
     if (settingsButton.getToggleState())
     {
@@ -357,5 +461,15 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         g.setFont (12.0f);
         for (size_t i = 0; i < labelRects.size(); ++i)
             g.drawText (labelTexts[i], labelRects[i], juce::Justification::centredLeft);
+
+        // barra de arco-iris por tras do slider do matiz
+        const auto bar = hueSlider.getBounds().toFloat()
+                             .withSizeKeepingCentre ((float) hueSlider.getWidth() - 16.0f, 6.0f);
+        juce::ColourGradient hueGrad (juce::Colour::fromHSV (0.0f, 0.75f, 1.0f, 1.0f), bar.getX(), 0.0f,
+                                      juce::Colour::fromHSV (1.0f, 0.75f, 1.0f, 1.0f), bar.getRight(), 0.0f, false);
+        for (int i = 1; i < 6; ++i)
+            hueGrad.addColour ((double) i / 6.0, juce::Colour::fromHSV ((float) i / 6.0f, 0.75f, 1.0f, 1.0f));
+        g.setGradientFill (hueGrad);
+        g.fillRoundedRectangle (bar, 3.0f);
     }
 }

@@ -88,6 +88,11 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    // leitura ao passar o rato
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override;
+
 private:
     static constexpr int fftSize = SpectrumAnalyzerProcessor::fftSize;
     static constexpr int numBins = fftSize / 2;
@@ -95,6 +100,8 @@ private:
     void timerCallback() override;
     float levelBetween (float f0, float f1, float binHz) const;
     juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const;
+    juce::Rectangle<float> getPlotBounds() const;
+    void updateSwatchSelection();
     void setPanelVisible (bool shouldBeVisible);
 
     SpectrumAnalyzerProcessor& audioProcessor;
@@ -114,6 +121,10 @@ private:
     std::array<juce::String, 5> labelTexts;
 
     float hueOffset = 0.0f;
+
+    // posicao do rato
+    juce::Point<float> hoverPos;
+    bool hoverActive = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumAnalyzerEditor)
 };

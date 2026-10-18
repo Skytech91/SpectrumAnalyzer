@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "")
 
-project(SpectrumAnalyzer VERSION 0.1.0)
+project(SpectrumAnalyzer VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,8 +18,8 @@ FetchContent_Declare(JUCE
 FetchContent_MakeAvailable(JUCE)
 
 juce_add_plugin(SpectrumAnalyzer
-    COMPANY_NAME "Estudio"
-    PLUGIN_MANUFACTURER_CODE Estd
+    COMPANY_NAME "Mugen"
+    PLUGIN_MANUFACTURER_CODE Mugn
     PLUGIN_CODE Span
     FORMATS VST3
     PRODUCT_NAME "Spectrum Analyzer"
