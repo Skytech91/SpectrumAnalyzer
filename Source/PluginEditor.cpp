@@ -15,6 +15,12 @@ namespace
     constexpr float rangeTable[]   = { -60.0f, -90.0f, -120.0f };
     constexpr float peakFallDb     = 0.3f;                    // per frame (about 9 dB/s)
 
+    constexpr int   scopeTimeMs[]    = { 20, 50, 100 };
+    constexpr float scopeFilterHz[]  = { 120.0f, 200.0f, 0.0f };   // 0 = full range
+
+    constexpr float stripBorder = 10.0f;
+    constexpr float loudnessWidth = 210.0f;
+
     const juce::Colour backgrounds[] = { juce::Colour (0xff101418),   // graphite
                                          juce::Colour (0xff000000),   // black
                                          juce::Colour (0xff0b1226),   // midnight blue
@@ -36,6 +42,30 @@ namespace
         const int octave = midi / 12 - 1;
         return juce::String (names[index]) + juce::String (octave);
     }
+
+    // second-order low-pass filter (RBJ cookbook)
+    void designLowpass (Biquad& bq, double fs, double fc, double q)
+    {
+        const double w0 = 2.0 * juce::MathConstants<double>::pi * fc / fs;
+        const double cosw = std::cos (w0);
+        const double alpha = std::sin (w0) / (2.0 * q);
+        const double a0 = 1.0 + alpha;
+
+        bq.b0 = (1.0 - cosw) * 0.5 / a0;
+        bq.b1 = (1.0 - cosw) / a0;
+        bq.b2 = bq.b0;
+        bq.a1 = -2.0 * cosw / a0;
+        bq.a2 = (1.0 - alpha) / a0;
+        bq.reset();
+    }
+
+    juce::String loudnessText (float value, const juce::String& unit)
+    {
+        if (value <= -70.0f)
+            return "-inf " + unit;
+
+        return juce::String (value, 1) + " " + unit;
+    }
 }
 
 SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
@@ -47,16 +77,37 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     rebuildFft (2048 << juce::jlimit (0, 3, s.fftSizeIndex.load()));
     lastStereoMode = juce::jlimit (0, 2, s.stereoMode.load());
 
-    labelTexts = { juce::String ("Color mode"), juce::String ("Color"), juce::String ("Color B (R / Side)"),
+    labelTexts = { juce::String ("Color mode"), juce::String ("Color (Mix)"),
+                   juce::String ("Stereo colors (L / Mid  -  R / Side)"),
                    juce::String ("Fill"), juce::String ("Line thickness"), juce::String ("Background"),
                    juce::String ("Tilt"), juce::String ("Speed"), juce::String ("Range"),
-                   juce::String ("Channels"), juce::String ("FFT size") };
+                   juce::String ("Channels"), juce::String ("FFT size"),
+                   juce::String ("Scope time"), juce::String ("Scope filter") };
 
     // "Settings" button with gear icon
-    settingsButton.onClick = [this] { setPanelVisible (settingsButton.getToggleState()); };
+    settingsButton.onClick = [this] { updatePanelVisibility(); };
     addAndMakeVisible (settingsButton);
 
-    // colour mode: single colour / rainbow
+    // tabs inside the settings panel
+    tabLook.setButtonText ("Look");
+    tabAnalyzer.setButtonText ("Analyzer");
+    tabScope.setButtonText ("Scope / Meter");
+
+    for (auto* tab : { &tabLook, &tabAnalyzer, &tabScope })
+    {
+        tab->setClickingTogglesState (true);
+        tab->setRadioGroupId (101);
+        tab->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff262d36));
+        tab->setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff4a5868));
+        addChildComponent (*tab);
+    }
+
+    tabLook.setToggleState (true, juce::dontSendNotification);
+    tabLook.onClick     = [this] { panelPage = 0; updatePanelVisibility(); };
+    tabAnalyzer.onClick = [this] { panelPage = 1; updatePanelVisibility(); };
+    tabScope.onClick    = [this] { panelPage = 2; updatePanelVisibility(); };
+
+    // colour mode: single colour / rainbow (Mix mode)
     modeBox.addItem ("Single color", 1);
     modeBox.addItem ("Rainbow", 2);
     modeBox.setSelectedId (s.colourMode.load() + 1, juce::dontSendNotification);
@@ -67,7 +118,7 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     };
     addChildComponent (modeBox);
 
-    // colours to pick from
+    // colours for the Mix curve
     updateSwatchSelection();
     swatches.onPick = [this] (juce::Colour c)
     {
@@ -77,12 +128,16 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     };
     addChildComponent (swatches);
 
-    // colour of the second curve (right / side) in the two-curve modes
+    // colours for the two-curve modes (Left/Right and Mid/Side share this pair)
+    swatchesStereoA.setSelectedFromColour (juce::Colour (s.colourStereoA.load()));
+    swatchesStereoA.onPick = [this] (juce::Colour c) { audioProcessor.settings.colourStereoA = c.getARGB(); };
+    addChildComponent (swatchesStereoA);
+
     swatchesB.setSelectedFromColour (juce::Colour (s.colourB.load()));
     swatchesB.onPick = [this] (juce::Colour c) { audioProcessor.settings.colourB = c.getARGB(); };
     addChildComponent (swatchesB);
 
-    // any colour, using hue (the rainbow bar is drawn behind the slider)
+    // any colour for Mix, using hue (the rainbow bar is drawn behind the slider)
     hueSlider.setSliderStyle (juce::Slider::LinearHorizontal);
     hueSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     hueSlider.setRange (0.0, 1.0, 0.001);
@@ -183,11 +238,37 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     fftBox.onChange = [this] { audioProcessor.settings.fftSizeIndex = fftBox.getSelectedId() - 1; };
     addChildComponent (fftBox);
 
-    setPanelVisible (false);
+    // scope
+    scopeToggle.setButtonText ("Show scope");
+    scopeToggle.setToggleState (s.showScope.load(), juce::dontSendNotification);
+    scopeToggle.onClick = [this] { audioProcessor.settings.showScope = scopeToggle.getToggleState(); repaint(); };
+    addChildComponent (scopeToggle);
+
+    scopeTimeBox.addItem ("20 ms", 1);
+    scopeTimeBox.addItem ("50 ms", 2);
+    scopeTimeBox.addItem ("100 ms", 3);
+    scopeTimeBox.setSelectedId (s.scopeTime.load() + 1, juce::dontSendNotification);
+    scopeTimeBox.onChange = [this] { audioProcessor.settings.scopeTime = scopeTimeBox.getSelectedId() - 1; };
+    addChildComponent (scopeTimeBox);
+
+    scopeFilterBox.addItem ("Low-pass 120 Hz", 1);
+    scopeFilterBox.addItem ("Low-pass 200 Hz", 2);
+    scopeFilterBox.addItem ("Full range", 3);
+    scopeFilterBox.setSelectedId (s.scopeFilter.load() + 1, juce::dontSendNotification);
+    scopeFilterBox.onChange = [this] { audioProcessor.settings.scopeFilter = scopeFilterBox.getSelectedId() - 1; };
+    addChildComponent (scopeFilterBox);
+
+    // loudness meter
+    loudnessToggle.setButtonText ("Show loudness meter (LUFS)");
+    loudnessToggle.setToggleState (s.showLoudness.load(), juce::dontSendNotification);
+    loudnessToggle.onClick = [this] { audioProcessor.settings.showLoudness = loudnessToggle.getToggleState(); repaint(); };
+    addChildComponent (loudnessToggle);
+
+    updatePanelVisibility();
 
     setResizable (true, true);
-    setResizeLimits (580, 400, 1600, 900);
-    setSize (780, 460);
+    setResizeLimits (600, 470, 1600, 1000);
+    setSize (800, 580);
 
     startTimerHz (30);   // refresh 30 times per second
 }
@@ -220,7 +301,7 @@ void SpectrumAnalyzerEditor::rebuildFft (int newSize)
     lastReadoutX = -1.0f;
 }
 
-// In rainbow mode no colour circle stays selected
+// In rainbow mode no Mix colour circle stays selected
 void SpectrumAnalyzerEditor::updateSwatchSelection()
 {
     if (audioProcessor.settings.colourMode.load() == 1)
@@ -229,26 +310,89 @@ void SpectrumAnalyzerEditor::updateSwatchSelection()
         swatches.setSelectedFromColour (juce::Colour (audioProcessor.settings.singleColour.load()));
 }
 
-void SpectrumAnalyzerEditor::setPanelVisible (bool shouldBeVisible)
+// Shows the controls of the current page of the settings panel (or hides everything)
+void SpectrumAnalyzerEditor::updatePanelVisibility()
 {
-    const std::array<juce::Component*, 14> controls = { &modeBox, &swatches, &swatchesB, &hueSlider, &animateToggle,
-                                                       &fillBox, &thicknessSlider, &backgroundBox,
-                                                       &peakToggle, &tiltBox, &speedBox, &rangeBox,
-                                                       &channelsBox, &fftBox };
-    for (auto* c : controls)
-        c->setVisible (shouldBeVisible);
+    const bool open = settingsButton.getToggleState();
 
+    auto show = [] (std::initializer_list<juce::Component*> list, bool visible)
+    {
+        for (auto* c : list)
+            c->setVisible (visible);
+    };
+
+    show ({ &tabLook, &tabAnalyzer, &tabScope }, open);
+
+    show ({ &modeBox, &swatches, &hueSlider, &swatchesStereoA, &swatchesB,
+            &animateToggle, &fillBox, &thicknessSlider, &backgroundBox }, open && panelPage == 0);
+
+    show ({ &peakToggle, &tiltBox, &speedBox, &rangeBox, &channelsBox, &fftBox }, open && panelPage == 1);
+
+    show ({ &scopeToggle, &scopeTimeBox, &scopeFilterBox, &loudnessToggle }, open && panelPage == 2);
+
+    resized();
     repaint();
+}
+
+// ---------------------------------------------------------------- layout
+
+float SpectrumAnalyzerEditor::getStripHeight() const
+{
+    const auto& s = audioProcessor.settings;
+
+    if (! (s.showScope.load() || s.showLoudness.load()))
+        return 0.0f;
+
+    const float available = (float) getHeight() - 32.0f;
+    return juce::jlimit (112.0f, 240.0f, available * 0.34f);
 }
 
 juce::Rectangle<float> SpectrumAnalyzerEditor::getPlotBounds() const
 {
     auto bounds = getLocalBounds().toFloat();
     bounds.removeFromTop (32.0f);
+    bounds.removeFromBottom (getStripHeight());
+
     auto plot = bounds.reduced (10.0f);
     plot.removeFromLeft (30.0f);
     plot.removeFromBottom (18.0f);
     return plot;
+}
+
+juce::Rectangle<float> SpectrumAnalyzerEditor::getStripArea() const
+{
+    auto bounds = getLocalBounds().toFloat();
+    auto strip = bounds.removeFromBottom (getStripHeight());
+    return strip.reduced (stripBorder, 6.0f);
+}
+
+juce::Rectangle<float> SpectrumAnalyzerEditor::getLoudnessBounds() const
+{
+    if (! audioProcessor.settings.showLoudness.load())
+        return {};
+
+    auto area = getStripArea();
+    return area.removeFromRight (juce::jmin (loudnessWidth, area.getWidth()));
+}
+
+juce::Rectangle<float> SpectrumAnalyzerEditor::getScopeBounds() const
+{
+    if (! audioProcessor.settings.showScope.load())
+        return {};
+
+    auto area = getStripArea();
+
+    if (audioProcessor.settings.showLoudness.load())
+        area.removeFromRight (loudnessWidth + 10.0f);
+
+    area.removeFromLeft (30.0f);     // lines up with the analyzer plot
+    return area;
+}
+
+juce::Rectangle<int> SpectrumAnalyzerEditor::getResetRect() const
+{
+    const auto inner = getLoudnessBounds().toNearestInt().reduced (12, 8);
+    return juce::Rectangle<int> (inner.getRight() - 46, inner.getY(), 46, 16);
 }
 
 void SpectrumAnalyzerEditor::resized()
@@ -258,11 +402,17 @@ void SpectrumAnalyzerEditor::resized()
     legendA = juce::Rectangle<int> (getWidth() - 116 - 190, 5, 84, 24);
     legendB = juce::Rectangle<int> (getWidth() - 116 - 100, 5, 92, 24);
 
-    panelBounds = juce::Rectangle<int> (getWidth() - 530, 38, 520, 350);
+    const int pageHeights[] = { 410, 328, 212 };
+    panelBounds = juce::Rectangle<int> (getWidth() - 290, 38, 280, pageHeights[juce::jlimit (0, 2, panelPage)]);
+
     auto inner = panelBounds.reduced (14, 12);
-    auto left = inner.removeFromLeft (236);
-    inner.removeFromLeft (20);
-    auto right = inner;
+
+    auto tabs = inner.removeFromTop (24);
+    inner.removeFromTop (8);
+    const int tabWidth = tabs.getWidth() / 3;
+    tabLook.setBounds (tabs.removeFromLeft (tabWidth));
+    tabAnalyzer.setBounds (tabs.removeFromLeft (tabWidth));
+    tabScope.setBounds (tabs);
 
     int labelIndex = 0;
     auto nextLabel = [&] (juce::Rectangle<int>& column)
@@ -270,58 +420,88 @@ void SpectrumAnalyzerEditor::resized()
         labelRects[(size_t) labelIndex++] = column.removeFromTop (16);
     };
 
-    // left column: look
-    nextLabel (left);                               // Color mode
-    modeBox.setBounds (left.removeFromTop (24));
-    left.removeFromTop (8);
+    // page 0: look
+    {
+        auto col = inner;
 
-    nextLabel (left);                               // Color
-    swatches.setBounds (left.removeFromTop (24));
-    left.removeFromTop (2);
-    hueSlider.setBounds (left.removeFromTop (18));
-    left.removeFromTop (8);
+        nextLabel (col);                                // Color mode
+        modeBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (left);                               // Color B
-    swatchesB.setBounds (left.removeFromTop (24));
-    left.removeFromTop (8);
+        nextLabel (col);                                // Color (Mix)
+        swatches.setBounds (col.removeFromTop (24));
+        col.removeFromTop (2);
+        hueSlider.setBounds (col.removeFromTop (18));
+        col.removeFromTop (8);
 
-    animateToggle.setBounds (left.removeFromTop (24));
-    left.removeFromTop (8);
+        nextLabel (col);                                // Stereo colors
+        swatchesStereoA.setBounds (col.removeFromTop (24));
+        col.removeFromTop (4);
+        swatchesB.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (left);                               // Fill
-    fillBox.setBounds (left.removeFromTop (24));
-    left.removeFromTop (8);
+        animateToggle.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (left);                               // Line thickness
-    thicknessSlider.setBounds (left.removeFromTop (18));
-    left.removeFromTop (8);
+        nextLabel (col);                                // Fill
+        fillBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (left);                               // Background
-    backgroundBox.setBounds (left.removeFromTop (24));
+        nextLabel (col);                                // Line thickness
+        thicknessSlider.setBounds (col.removeFromTop (18));
+        col.removeFromTop (8);
 
-    // right column: analyzer
-    peakToggle.setBounds (right.removeFromTop (24));
-    right.removeFromTop (8);
+        nextLabel (col);                                // Background
+        backgroundBox.setBounds (col.removeFromTop (24));
+    }
 
-    nextLabel (right);                              // Tilt
-    tiltBox.setBounds (right.removeFromTop (24));
-    right.removeFromTop (8);
+    // page 1: analyzer
+    {
+        auto col = inner;
 
-    nextLabel (right);                              // Speed
-    speedBox.setBounds (right.removeFromTop (24));
-    right.removeFromTop (8);
+        peakToggle.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (right);                              // Range
-    rangeBox.setBounds (right.removeFromTop (24));
-    right.removeFromTop (8);
+        nextLabel (col);                                // Tilt
+        tiltBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (right);                              // Channels
-    channelsBox.setBounds (right.removeFromTop (24));
-    right.removeFromTop (8);
+        nextLabel (col);                                // Speed
+        speedBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
 
-    nextLabel (right);                              // FFT size
-    fftBox.setBounds (right.removeFromTop (24));
+        nextLabel (col);                                // Range
+        rangeBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
+
+        nextLabel (col);                                // Channels
+        channelsBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
+
+        nextLabel (col);                                // FFT size
+        fftBox.setBounds (col.removeFromTop (24));
+    }
+
+    // page 2: scope and loudness meter
+    {
+        auto col = inner;
+
+        scopeToggle.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
+
+        nextLabel (col);                                // Scope time
+        scopeTimeBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (8);
+
+        nextLabel (col);                                // Scope filter
+        scopeFilterBox.setBounds (col.removeFromTop (24));
+        col.removeFromTop (12);
+
+        loudnessToggle.setBounds (col.removeFromTop (24));
+    }
 }
+
+// ---------------------------------------------------------------- mouse
 
 void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
 {
@@ -337,20 +517,11 @@ void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
     const bool overLegend = audioProcessor.settings.stereoMode.load() != 0
                             && (legendA.contains (e.getPosition()) || legendB.contains (e.getPosition()));
 
-    setMouseCursor (overLegend ? juce::MouseCursor::PointingHandCursor
-                               : (hoverActive ? juce::MouseCursor::CrosshairCursor
-                                              : juce::MouseCursor::NormalCursor));
-}
+    const bool overReset = audioProcessor.settings.showLoudness.load() && getResetRect().contains (e.getPosition());
 
-void SpectrumAnalyzerEditor::mouseDown (const juce::MouseEvent& e)
-{
-    if (audioProcessor.settings.stereoMode.load() == 0)
-        return;
-
-    if (legendA.contains (e.getPosition()))
-        showA = ! showA;
-    else if (legendB.contains (e.getPosition()))
-        showB = ! showB;
+    setMouseCursor ((overLegend || overReset) ? juce::MouseCursor::PointingHandCursor
+                                              : (hoverActive ? juce::MouseCursor::CrosshairCursor
+                                                             : juce::MouseCursor::NormalCursor));
 }
 
 void SpectrumAnalyzerEditor::mouseDrag (const juce::MouseEvent& e)
@@ -364,6 +535,27 @@ void SpectrumAnalyzerEditor::mouseExit (const juce::MouseEvent&)
     lastReadoutX = -1.0f;
     setMouseCursor (juce::MouseCursor::NormalCursor);
 }
+
+void SpectrumAnalyzerEditor::mouseDown (const juce::MouseEvent& e)
+{
+    // loudness meter: "Reset" restarts the integrated loudness and the peak
+    if (audioProcessor.settings.showLoudness.load() && getResetRect().contains (e.getPosition()))
+    {
+        audioProcessor.resetLoudnessRequested = true;
+        return;
+    }
+
+    // legend: hide / show a curve
+    if (audioProcessor.settings.stereoMode.load() == 0)
+        return;
+
+    if (legendA.contains (e.getPosition()))
+        showA = ! showA;
+    else if (legendB.contains (e.getPosition()))
+        showB = ! showB;
+}
+
+// ---------------------------------------------------------------- analysis
 
 // FFT of one channel -> dB, smoothed, plus peak hold
 void SpectrumAnalyzerEditor::updateSpectrum (const float* samples, Spectrum& smoothedOut, Spectrum& peaksOut,
@@ -386,6 +578,51 @@ void SpectrumAnalyzerEditor::updateSpectrum (const float* samples, Spectrum& smo
         float& pk = peaksOut[(size_t) i];
         pk = peaksOn ? std::max (s, pk - peakFallDb) : s;
     }
+}
+
+// Scope: low-passed mono waveform, aligned on a rising zero crossing so it stays still
+void SpectrumAnalyzerEditor::updateScope()
+{
+    const auto& settings = audioProcessor.settings;
+    const double fs = audioProcessor.getCurrentSampleRate();
+
+    const int windowSamples = juce::jlimit (64, maxFftSize / 2,
+                                            (int) std::lround (fs * 0.001 * scopeTimeMs[juce::jlimit (0, 2, settings.scopeTime.load())]));
+    const int preRoll = juce::jlimit (1, maxFftSize / 4, (int) std::lround (fs * 0.05));
+    const int extra   = juce::jlimit (1, maxFftSize - windowSamples - preRoll, (int) std::lround (fs * 0.05));
+    const int total   = preRoll + extra + windowSamples;
+
+    audioProcessor.copyLatestSamples (bufL.data(), 0, total);
+    audioProcessor.copyLatestSamples (bufR.data(), 1, total);
+
+    for (int i = 0; i < total; ++i)
+        scopeWork[(size_t) i] = 0.5f * (bufL[(size_t) i] + bufR[(size_t) i]);
+
+    const float cutoff = scopeFilterHz[juce::jlimit (0, 2, settings.scopeFilter.load())];
+
+    if (cutoff > 0.0f)
+    {
+        Biquad f1, f2;
+        designLowpass (f1, fs, (double) cutoff, 0.70710678);
+        f2 = f1;
+
+        for (int i = 0; i < total; ++i)
+            scopeWork[(size_t) i] = (float) f2.process (f1.process ((double) scopeWork[(size_t) i]));
+    }
+
+    // trigger: the latest rising zero crossing that still leaves room for the whole window
+    int start = total - windowSamples;
+    for (int c = total - windowSamples; c >= preRoll; --c)
+    {
+        if (scopeWork[(size_t) c - 1] < 0.0f && scopeWork[(size_t) c] >= 0.0f)
+        {
+            start = c;
+            break;
+        }
+    }
+
+    std::copy (scopeWork.begin() + start, scopeWork.begin() + start + windowSamples, scopeData.begin());
+    scopeCount = windowSamples;
 }
 
 void SpectrumAnalyzerEditor::timerCallback()
@@ -432,11 +669,15 @@ void SpectrumAnalyzerEditor::timerCallback()
     if (mode != 0)
         updateSpectrum (bufR.data(), smoothedB, peaksB, attack, release, peaksOn);
 
-    // 3. animated rainbow: the colours slide slowly
+    // 3. scope
+    if (settings.showScope.load())
+        updateScope();
+
+    // 4. animated rainbow: the colours slide slowly
     if (settings.animate.load() && settings.colourMode.load() == 1)
         hueOffset = std::fmod (hueOffset + 0.0025f, 1.0f);
 
-    // 4. hover readout: levels are smoothed and the text only changes ~5 times per second
+    // 5. hover readout: levels are smoothed and the text only changes ~5 times per second
     if (hoverActive)
     {
         const auto plot = getPlotBounds();
@@ -521,15 +762,15 @@ float SpectrumAnalyzerEditor::levelAt (const Spectrum& data, float f0, float f1,
     return m + tilt * std::log2 (std::sqrt (f0 * f1) / 1000.0f);
 }
 
-// Colour of the curve along the frequency axis (left -> right), for the Mix mode
-juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const
+// Colour along the horizontal axis of an area (left -> right), for the Mix curve and the scope
+juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> area, float alpha) const
 {
     const auto& s = audioProcessor.settings;
 
     if (s.colourMode.load() == 0)
     {
         const auto c = juce::Colour (s.singleColour.load()).withAlpha (alpha);
-        return juce::ColourGradient (c, plot.getX(), 0.0f, c, plot.getRight(), 0.0f, false);
+        return juce::ColourGradient (c, area.getX(), 0.0f, c, area.getRight(), 0.0f, false);
     }
 
     const int stops = 12;
@@ -539,12 +780,104 @@ juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Recta
         return juce::Colour::fromHSV (std::fmod (offset + 0.8f * t, 1.0f), 0.7f, 1.0f, alpha);
     };
 
-    juce::ColourGradient grad (colourAt (0.0f), plot.getX(), 0.0f,
-                               colourAt (1.0f), plot.getRight(), 0.0f, false);
+    juce::ColourGradient grad (colourAt (0.0f), area.getX(), 0.0f,
+                               colourAt (1.0f), area.getRight(), 0.0f, false);
     for (int i = 1; i < stops; ++i)
         grad.addColour ((double) i / (double) stops, colourAt ((float) i / (float) stops));
 
     return grad;
+}
+
+// ---------------------------------------------------------------- drawing
+
+void SpectrumAnalyzerEditor::drawScope (juce::Graphics& g, juce::Rectangle<float> area)
+{
+    const auto& s = audioProcessor.settings;
+
+    g.setColour (juce::Colours::white.withAlpha (0.04f));
+    g.fillRoundedRectangle (area, 6.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.10f));
+    g.drawRoundedRectangle (area, 6.0f, 1.0f);
+
+    // grid: centre line and +-0.5
+    const float cy = area.getCentreY();
+    const float half = area.getHeight() * 0.5f - 6.0f;
+
+    g.setColour (juce::Colours::white.withAlpha (0.14f));
+    g.drawHorizontalLine ((int) cy, area.getX(), area.getRight());
+    g.setColour (juce::Colours::white.withAlpha (0.06f));
+    g.drawHorizontalLine ((int) (cy - half * 0.5f), area.getX(), area.getRight());
+    g.drawHorizontalLine ((int) (cy + half * 0.5f), area.getX(), area.getRight());
+
+    // title
+    const int timeIndex = juce::jlimit (0, 2, s.scopeTime.load());
+    const int filterIndex = juce::jlimit (0, 2, s.scopeFilter.load());
+    juce::String title = "SCOPE   " + juce::String (scopeTimeMs[timeIndex]) + " ms   ";
+    title += (filterIndex == 2) ? juce::String ("full range")
+                                : "low-pass " + juce::String ((int) scopeFilterHz[filterIndex]) + " Hz";
+
+    g.setColour (juce::Colours::white.withAlpha (0.45f));
+    g.setFont (11.0f);
+    g.drawText (title, area.toNearestInt().reduced (8, 3).removeFromTop (14), juce::Justification::centredLeft);
+
+    // waveform
+    if (scopeCount >= 2)
+    {
+        juce::Path wave;
+        for (int i = 0; i < scopeCount; ++i)
+        {
+            const float x = area.getX() + area.getWidth() * (float) i / (float) (scopeCount - 1);
+            const float y = cy - juce::jlimit (-1.0f, 1.0f, scopeData[(size_t) i]) * half;
+
+            if (i == 0) wave.startNewSubPath (x, y);
+            else        wave.lineTo (x, y);
+        }
+
+        juce::Graphics::ScopedSaveState state (g);
+        g.reduceClipRegion (area.toNearestInt());
+        g.setGradientFill (makeHorizontalGradient (area, 1.0f));
+        g.strokePath (wave, juce::PathStrokeType (juce::jmax (1.2f, s.lineThickness.load())));
+    }
+}
+
+void SpectrumAnalyzerEditor::drawLoudness (juce::Graphics& g, juce::Rectangle<float> area)
+{
+    g.setColour (juce::Colours::white.withAlpha (0.04f));
+    g.fillRoundedRectangle (area, 8.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.10f));
+    g.drawRoundedRectangle (area, 8.0f, 1.0f);
+
+    auto inner = area.toNearestInt().reduced (12, 8);
+
+    // header: title and Reset
+    auto header = inner.removeFromTop (16);
+    g.setFont (11.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.45f));
+    g.drawText ("LOUDNESS", header, juce::Justification::centredLeft);
+
+    const auto resetRect = getResetRect();
+    g.setColour (juce::Colours::white.withAlpha (0.12f));
+    g.fillRoundedRectangle (resetRect.toFloat(), 4.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.8f));
+    g.drawText ("Reset", resetRect, juce::Justification::centred);
+
+    auto row = [&] (const juce::String& label, const juce::String& value, juce::Colour valueColour)
+    {
+        auto r = inner.removeFromTop (16);
+        g.setFont (11.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.55f));
+        g.drawText (label, r, juce::Justification::centredLeft);
+        g.setFont (12.0f);
+        g.setColour (valueColour);
+        g.drawText (value, r, juce::Justification::centredRight);
+    };
+
+    const float peak = audioProcessor.samplePeakDb.load();
+
+    row ("Momentary",  loudnessText (audioProcessor.loudnessMomentary.load(), "LUFS"),  juce::Colours::white);
+    row ("Short-term", loudnessText (audioProcessor.loudnessShortTerm.load(), "LUFS"),  juce::Colours::white);
+    row ("Integrated", loudnessText (audioProcessor.loudnessIntegrated.load(), "LUFS"), juce::Colours::white);
+    row ("Peak",       loudnessText (peak, "dBFS"), peak >= -0.1f ? juce::Colour (0xffff5a5a) : juce::Colours::white);
 }
 
 void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
@@ -558,8 +891,8 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
     const int mode = juce::jlimit (0, 2, s.stereoMode.load());
     const bool stereo = (mode != 0);
 
-    // in the two-curve modes both curves use two fixed, clearly different colours
-    const auto colourA = juce::Colour (s.singleColour.load());
+    // in the two-curve modes both curves use their own pair of colours
+    const auto colourA = juce::Colour (s.colourStereoA.load());
     const auto colourB = juce::Colour (s.colourB.load());
 
     // signature
@@ -740,6 +1073,20 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         }
     }
 
+    // bottom strip: scope and loudness meter
+    if (getStripHeight() > 0.0f)
+    {
+        const auto strip = getLocalBounds().toFloat().removeFromBottom (getStripHeight());
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.drawHorizontalLine ((int) strip.getY(), 0.0f, (float) getWidth());
+
+        if (s.showScope.load())
+            drawScope (g, getScopeBounds());
+
+        if (s.showLoudness.load())
+            drawLoudness (g, getLoudnessBounds());
+    }
+
     // hover readout: frequency, note and level(s)
     if (hoverActive && width >= 2)
     {
@@ -798,30 +1145,32 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         g.setColour (juce::Colours::white.withAlpha (0.14f));
         g.drawRoundedRectangle (panelBounds.toFloat(), 10.0f, 1.0f);
 
-        // divider between the two columns
-        const float dividerX = (float) (panelBounds.getX() + 14 + 236 + 10);
-        g.setColour (juce::Colours::white.withAlpha (0.10f));
-        g.drawVerticalLine ((int) dividerX, (float) panelBounds.getY() + 14.0f, (float) panelBounds.getBottom() - 14.0f);
+        // which labels belong to the current page
+        const int firstLabel = (panelPage == 0) ? 0 : (panelPage == 1 ? 6 : 11);
+        const int lastLabel  = (panelPage == 0) ? 5 : (panelPage == 1 ? 10 : 12);
 
         g.setColour (juce::Colours::white.withAlpha (0.7f));
         g.setFont (12.0f);
-        for (size_t i = 0; i < labelRects.size(); ++i)
+        for (int i = firstLabel; i <= lastLabel; ++i)
         {
-            juce::String text = labelTexts[i];
+            juce::String text = labelTexts[(size_t) i];
             if (i == 0 && stereo && s.colourMode.load() == 1)
                 text = "Color mode (rainbow: Mix only)";
 
-            g.drawText (text, labelRects[i], juce::Justification::centredLeft);
+            g.drawText (text, labelRects[(size_t) i], juce::Justification::centredLeft);
         }
 
         // rainbow bar behind the hue slider
-        const auto bar = hueSlider.getBounds().toFloat()
-                             .withSizeKeepingCentre ((float) hueSlider.getWidth() - 16.0f, 6.0f);
-        juce::ColourGradient hueGrad (juce::Colour::fromHSV (0.0f, 0.75f, 1.0f, 1.0f), bar.getX(), 0.0f,
-                                      juce::Colour::fromHSV (1.0f, 0.75f, 1.0f, 1.0f), bar.getRight(), 0.0f, false);
-        for (int i = 1; i < 6; ++i)
-            hueGrad.addColour ((double) i / 6.0, juce::Colour::fromHSV ((float) i / 6.0f, 0.75f, 1.0f, 1.0f));
-        g.setGradientFill (hueGrad);
-        g.fillRoundedRectangle (bar, 3.0f);
+        if (hueSlider.isVisible())
+        {
+            const auto bar = hueSlider.getBounds().toFloat()
+                                 .withSizeKeepingCentre ((float) hueSlider.getWidth() - 16.0f, 6.0f);
+            juce::ColourGradient hueGrad (juce::Colour::fromHSV (0.0f, 0.75f, 1.0f, 1.0f), bar.getX(), 0.0f,
+                                          juce::Colour::fromHSV (1.0f, 0.75f, 1.0f, 1.0f), bar.getRight(), 0.0f, false);
+            for (int i = 1; i < 6; ++i)
+                hueGrad.addColour ((double) i / 6.0, juce::Colour::fromHSV ((float) i / 6.0f, 0.75f, 1.0f, 1.0f));
+            g.setGradientFill (hueGrad);
+            g.fillRoundedRectangle (bar, 3.0f);
+        }
     }
 }

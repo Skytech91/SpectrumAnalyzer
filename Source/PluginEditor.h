@@ -126,7 +126,7 @@ public:
     }
 };
 
-// Visual part: does the FFT, draws the spectrum and holds the settings panel.
+// Visual part: spectrum analyzer (top), scope and loudness meter (bottom strip), settings panel.
 class SpectrumAnalyzerEditor : public juce::AudioProcessorEditor,
                                private juce::Timer
 {
@@ -137,7 +137,6 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
 
-    // hover readout
     void mouseMove (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseExit (const juce::MouseEvent&) override;
@@ -152,11 +151,23 @@ private:
     void rebuildFft (int newSize);
     void updateSpectrum (const float* samples, Spectrum& smoothedOut, Spectrum& peaksOut,
                          float attack, float release, bool peaksOn);
+    void updateScope();
     float levelAt (const Spectrum& data, float f0, float f1, float binHz) const;
-    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const;
+    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> area, float alpha) const;
+
+    // layout
+    float getStripHeight() const;
     juce::Rectangle<float> getPlotBounds() const;
+    juce::Rectangle<float> getStripArea() const;
+    juce::Rectangle<float> getScopeBounds() const;
+    juce::Rectangle<float> getLoudnessBounds() const;
+    juce::Rectangle<int> getResetRect() const;
+
+    void drawScope (juce::Graphics& g, juce::Rectangle<float> area);
+    void drawLoudness (juce::Graphics& g, juce::Rectangle<float> area);
+
     void updateSwatchSelection();
-    void setPanelVisible (bool shouldBeVisible);
+    void updatePanelVisibility();
 
     SpectrumAnalyzerProcessor& audioProcessor;
 
@@ -174,15 +185,24 @@ private:
     Spectrum smoothedA {}, smoothedB {}, peaksA {}, peaksB {};
     int lastStereoMode = 0;
 
+    // scope
+    std::array<float, maxFftSize> scopeWork {};
+    std::array<float, maxFftSize / 2> scopeData {};
+    int scopeCount = 0;
+
     // settings panel
     GearButton settingsButton;
-    juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox, channelsBox, fftBox;
-    SwatchRow swatches, swatchesB;
+    juce::TextButton tabLook, tabAnalyzer, tabScope;
+    int panelPage = 0;
+
+    juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox, channelsBox, fftBox,
+                   scopeTimeBox, scopeFilterBox;
+    SwatchRow swatches, swatchesStereoA, swatchesB;
     juce::Slider hueSlider, thicknessSlider;
-    juce::ToggleButton animateToggle, peakToggle;
+    juce::ToggleButton animateToggle, peakToggle, scopeToggle, loudnessToggle;
     juce::Rectangle<int> panelBounds;
-    std::array<juce::Rectangle<int>, 11> labelRects;
-    std::array<juce::String, 11> labelTexts;
+    std::array<juce::Rectangle<int>, 13> labelRects;
+    std::array<juce::String, 13> labelTexts;
 
     // legend (two-curve modes): click a name to hide / show that curve
     juce::Rectangle<int> legendA, legendB;
