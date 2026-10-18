@@ -40,17 +40,17 @@ namespace
 
 SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     : AudioProcessorEditor (&p),
-      audioProcessor (p),
-      fft (SpectrumAnalyzerProcessor::fftOrder),
-      window (fftSize, juce::dsp::WindowingFunction<float>::hann)
+      audioProcessor (p)
 {
-    smoothed.fill (floorDb);
-    peaks.fill (floorDb);
     auto& s = audioProcessor.settings;
+
+    rebuildFft (2048 << juce::jlimit (0, 3, s.fftSizeIndex.load()));
+    lastStereoMode = juce::jlimit (0, 2, s.stereoMode.load());
 
     labelTexts = { juce::String ("Color mode"), juce::String ("Color"), juce::String ("Fill"),
                    juce::String ("Line thickness"), juce::String ("Background"),
-                   juce::String ("Tilt"), juce::String ("Speed"), juce::String ("Range") };
+                   juce::String ("Tilt"), juce::String ("Speed"), juce::String ("Range"),
+                   juce::String ("Channels"), juce::String ("FFT size") };
 
     // "Settings" button with gear icon
     settingsButton.onClick = [this] { setPanelVisible (settingsButton.getToggleState()); };
@@ -161,6 +161,23 @@ SpectrumAnalyzerEditor::SpectrumAnalyzerEditor (SpectrumAnalyzerProcessor& p)
     rangeBox.onChange = [this] { audioProcessor.settings.range = rangeBox.getSelectedId() - 1; };
     addChildComponent (rangeBox);
 
+    // channels: mix / left-right / mid-side
+    channelsBox.addItem ("Mix (mono)", 1);
+    channelsBox.addItem ("Left / Right", 2);
+    channelsBox.addItem ("Mid / Side", 3);
+    channelsBox.setSelectedId (s.stereoMode.load() + 1, juce::dontSendNotification);
+    channelsBox.onChange = [this] { audioProcessor.settings.stereoMode = channelsBox.getSelectedId() - 1; };
+    addChildComponent (channelsBox);
+
+    // FFT size
+    fftBox.addItem ("2048", 1);
+    fftBox.addItem ("4096", 2);
+    fftBox.addItem ("8192", 3);
+    fftBox.addItem ("16384", 4);
+    fftBox.setSelectedId (s.fftSizeIndex.load() + 1, juce::dontSendNotification);
+    fftBox.onChange = [this] { audioProcessor.settings.fftSizeIndex = fftBox.getSelectedId() - 1; };
+    addChildComponent (fftBox);
+
     setPanelVisible (false);
 
     setResizable (true, true);
@@ -175,6 +192,29 @@ SpectrumAnalyzerEditor::~SpectrumAnalyzerEditor()
     stopTimer();
 }
 
+// Sets up the FFT for a new analysis size and clears the curves
+void SpectrumAnalyzerEditor::rebuildFft (int newSize)
+{
+    fftSize = newSize;
+    numBins = newSize / 2;
+
+    int order = 0;
+    while ((1 << order) < newSize)
+        ++order;
+
+    fft = std::make_unique<juce::dsp::FFT> (order);
+    // normalise = false: a full-scale sine wave then reads exactly 0 dB
+    window = std::make_unique<juce::dsp::WindowingFunction<float>> ((size_t) newSize,
+                                                                    juce::dsp::WindowingFunction<float>::hann,
+                                                                    false);
+
+    smoothedA.fill (floorDb);
+    smoothedB.fill (floorDb);
+    peaksA.fill (floorDb);
+    peaksB.fill (floorDb);
+    lastReadoutX = -1.0f;
+}
+
 // In rainbow mode no colour circle stays selected
 void SpectrumAnalyzerEditor::updateSwatchSelection()
 {
@@ -186,9 +226,10 @@ void SpectrumAnalyzerEditor::updateSwatchSelection()
 
 void SpectrumAnalyzerEditor::setPanelVisible (bool shouldBeVisible)
 {
-    const std::array<juce::Component*, 11> controls = { &modeBox, &swatches, &hueSlider, &animateToggle,
+    const std::array<juce::Component*, 13> controls = { &modeBox, &swatches, &hueSlider, &animateToggle,
                                                        &fillBox, &thicknessSlider, &backgroundBox,
-                                                       &peakToggle, &tiltBox, &speedBox, &rangeBox };
+                                                       &peakToggle, &tiltBox, &speedBox, &rangeBox,
+                                                       &channelsBox, &fftBox };
     for (auto* c : controls)
         c->setVisible (shouldBeVisible);
 
@@ -260,6 +301,14 @@ void SpectrumAnalyzerEditor::resized()
 
     nextLabel (right);                              // Range
     rangeBox.setBounds (right.removeFromTop (24));
+    right.removeFromTop (8);
+
+    nextLabel (right);                              // Channels
+    channelsBox.setBounds (right.removeFromTop (24));
+    right.removeFromTop (8);
+
+    nextLabel (right);                              // FFT size
+    fftBox.setBounds (right.removeFromTop (24));
 }
 
 void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
@@ -288,39 +337,78 @@ void SpectrumAnalyzerEditor::mouseExit (const juce::MouseEvent&)
     setMouseCursor (juce::MouseCursor::NormalCursor);
 }
 
+// FFT of one channel -> dB, smoothed, plus peak hold
+void SpectrumAnalyzerEditor::updateSpectrum (const float* samples, Spectrum& smoothedOut, Spectrum& peaksOut,
+                                             float attack, float release, bool peaksOn)
+{
+    std::copy (samples, samples + fftSize, fftData.begin());
+    std::fill (fftData.begin() + fftSize, fftData.begin() + 2 * fftSize, 0.0f);
+
+    window->multiplyWithWindowingTable (fftData.data(), (size_t) fftSize);
+    fft->performFrequencyOnlyForwardTransform (fftData.data());
+
+    const float scale = 4.0f / (float) fftSize;
+
+    for (int i = 0; i < numBins; ++i)
+    {
+        const float db = juce::Decibels::gainToDecibels (fftData[(size_t) i] * scale, floorDb);
+        float& s = smoothedOut[(size_t) i];
+        s += (db - s) * (db > s ? attack : release);
+
+        float& pk = peaksOut[(size_t) i];
+        pk = peaksOn ? std::max (s, pk - peakFallDb) : s;
+    }
+}
+
 void SpectrumAnalyzerEditor::timerCallback()
 {
     const auto& settings = audioProcessor.settings;
 
-    // 1. get the latest audio samples
-    audioProcessor.copyLatestSamples (fftData.data());
-    std::fill (fftData.begin() + fftSize, fftData.end(), 0.0f);
+    // FFT size changed in the settings?
+    const int wantedSize = 2048 << juce::jlimit (0, 3, settings.fftSizeIndex.load());
+    if (wantedSize != fftSize)
+        rebuildFft (wantedSize);
 
-    // 2. apply the window (Hann) and do the FFT
-    window.multiplyWithWindowingTable (fftData.data(), fftSize);
-    fft.performFrequencyOnlyForwardTransform (fftData.data());
+    // channel mode changed? start curve B from scratch
+    const int mode = juce::jlimit (0, 2, settings.stereoMode.load());
+    if (mode != lastStereoMode)
+    {
+        smoothedB.fill (floorDb);
+        peaksB.fill (floorDb);
+        lastStereoMode = mode;
+    }
 
-    // 3. convert to dB and smooth (speed setting), update peaks
+    // 1. latest samples of left and right
+    audioProcessor.copyLatestSamples (bufL.data(), 0, fftSize);
+    audioProcessor.copyLatestSamples (bufR.data(), 1, fftSize);
+
+    // mix and mid/side: A = (L+R)/2 (mid), B = (L-R)/2 (side)
+    if (mode != 1)
+    {
+        for (int i = 0; i < fftSize; ++i)
+        {
+            const float l = bufL[(size_t) i];
+            const float r = bufR[(size_t) i];
+            bufL[(size_t) i] = 0.5f * (l + r);
+            bufR[(size_t) i] = 0.5f * (l - r);
+        }
+    }
+
+    // 2. FFT -> dB -> smoothing (speed setting) and peaks
     const int speedIndex = juce::jlimit (0, 2, settings.speed.load());
     const float attack  = attackTable[speedIndex];
     const float release = releaseTable[speedIndex];
     const bool peaksOn = settings.peakHold.load();
 
-    for (int i = 0; i < numBins; ++i)
-    {
-        const float db = juce::Decibels::gainToDecibels (fftData[(size_t) i] * 4.0f / (float) fftSize, floorDb);
-        float& s = smoothed[(size_t) i];
-        s += (db - s) * (db > s ? attack : release);
+    updateSpectrum (bufL.data(), smoothedA, peaksA, attack, release, peaksOn);
+    if (mode != 0)
+        updateSpectrum (bufR.data(), smoothedB, peaksB, attack, release, peaksOn);
 
-        float& pk = peaks[(size_t) i];
-        pk = peaksOn ? std::max (s, pk - peakFallDb) : s;
-    }
-
-    // 4. animated rainbow: the colours slide slowly
+    // 3. animated rainbow: the colours slide slowly
     if (settings.animate.load() && settings.colourMode.load() == 1)
         hueOffset = std::fmod (hueOffset + 0.0025f, 1.0f);
 
-    // 5. hover readout: level is smoothed and the text only changes ~5 times per second
+    // 4. hover readout: levels are smoothed and the text only changes ~5 times per second
     if (hoverActive)
     {
         const auto plot = getPlotBounds();
@@ -335,21 +423,39 @@ void SpectrumAnalyzerEditor::timerCallback()
             const float f0 = minFreq * std::pow (ratio, t0);
             const float f1 = minFreq * std::pow (ratio, t1);
             const float binHz = (float) (audioProcessor.getCurrentSampleRate() / (double) fftSize);
-            const float level = levelAt (smoothed, f0, f1, binHz);
+            const float levelA = levelAt (smoothedA, f0, f1, binHz);
+            const float levelB = (mode != 0) ? levelAt (smoothedB, f0, f1, binHz) : floorDb;
 
             const bool moved = std::abs (x - lastReadoutX) > 0.5f;
             lastReadoutX = x;
 
-            if (moved)
-                readoutLevel = level;                             // mouse moved: respond at once
-            else
-                readoutLevel += (level - readoutLevel) * 0.1f;    // mouse still: steady value
+            if (moved)                                           // mouse moved: respond at once
+            {
+                readoutLevelA = levelA;
+                readoutLevelB = levelB;
+            }
+            else                                                 // mouse still: steady values
+            {
+                readoutLevelA += (levelA - readoutLevelA) * 0.1f;
+                readoutLevelB += (levelB - readoutLevelB) * 0.1f;
+            }
 
             if (moved || ++readoutTick >= 6)
             {
                 readoutTick = 0;
                 readoutLine1 = frequencyText (f0) + "   " + noteName (f0);
-                readoutLine2 = juce::String (readoutLevel, 1) + " dB";
+
+                if (mode == 0)
+                {
+                    readoutLine2 = juce::String (readoutLevelA, 1) + " dB";
+                }
+                else
+                {
+                    const juce::String nameA = (mode == 1) ? "L" : "M";
+                    const juce::String nameB = (mode == 1) ? "R" : "S";
+                    readoutLine2 = nameA + " " + juce::String (readoutLevelA, 1) + "   "
+                                 + nameB + " " + juce::String (readoutLevelB, 1) + " dB";
+                }
             }
         }
     }
@@ -358,7 +464,7 @@ void SpectrumAnalyzerEditor::timerCallback()
 }
 
 // Level (in dB) for a frequency range, including the tilt setting
-float SpectrumAnalyzerEditor::levelAt (const std::array<float, numBins>& data, float f0, float f1, float binHz) const
+float SpectrumAnalyzerEditor::levelAt (const Spectrum& data, float f0, float f1, float binHz) const
 {
     const float b0 = f0 / binHz;
     const float b1 = f1 / binHz;
@@ -387,19 +493,24 @@ float SpectrumAnalyzerEditor::levelAt (const std::array<float, numBins>& data, f
     return m + tilt * std::log2 (std::sqrt (f0 * f1) / 1000.0f);
 }
 
-// Colour of the curve along the frequency axis (left -> right)
-juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const
+// Colour of the curve along the frequency axis (left -> right).
+// "secondary" is the colour of curve B (the opposite colour of curve A).
+juce::ColourGradient SpectrumAnalyzerEditor::makeHorizontalGradient (juce::Rectangle<float> plot, float alpha,
+                                                                     bool secondary) const
 {
     const auto& s = audioProcessor.settings;
 
     if (s.colourMode.load() == 0)
     {
-        const auto c = juce::Colour (s.singleColour.load()).withAlpha (alpha);
+        auto c = juce::Colour (s.singleColour.load());
+        if (secondary)
+            c = c.withRotatedHue (0.5f);
+        c = c.withAlpha (alpha);
         return juce::ColourGradient (c, plot.getX(), 0.0f, c, plot.getRight(), 0.0f, false);
     }
 
     const int stops = 12;
-    const float offset = hueOffset;
+    const float offset = hueOffset + (secondary ? 0.5f : 0.0f);
     auto colourAt = [offset, alpha] (float t)
     {
         return juce::Colour::fromHSV (std::fmod (offset + 0.8f * t, 1.0f), 0.7f, 1.0f, alpha);
@@ -421,11 +532,38 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
 
     const auto plot = getPlotBounds();
     const auto header = getLocalBounds().toFloat().removeFromTop (32.0f);
+    const int mode = juce::jlimit (0, 2, s.stereoMode.load());
 
     // signature
     g.setColour (juce::Colours::white.withAlpha (0.85f));
     g.setFont (14.0f);
     g.drawText ("Made by Mugen", header.toNearestInt().withTrimmedLeft (14), juce::Justification::centredLeft);
+
+    // legend for two-curve modes: solid line = A, dashed line = B
+    if (mode != 0)
+    {
+        const bool single = s.colourMode.load() == 0;
+        const auto colourA = single ? juce::Colour (s.singleColour.load()) : juce::Colours::white;
+        const auto colourB = single ? colourA.withRotatedHue (0.5f) : juce::Colours::white;
+        const juce::String nameA = (mode == 1) ? "L" : "Mid";
+        const juce::String nameB = (mode == 1) ? "R" : "Side";
+
+        const float ly = header.getCentreY();
+        float lx = (float) getWidth() - 116.0f - 150.0f;
+
+        g.setColour (colourA);
+        g.drawLine (lx, ly, lx + 18.0f, ly, 2.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.8f));
+        g.setFont (12.0f);
+        g.drawText (nameA, juce::Rectangle<int> ((int) lx + 22, (int) ly - 8, 34, 16), juce::Justification::centredLeft);
+
+        lx += 66.0f;
+        g.setColour (colourB);
+        for (int k = 0; k < 3; ++k)
+            g.drawLine (lx + (float) k * 7.0f, ly, lx + (float) k * 7.0f + 4.0f, ly, 2.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.8f));
+        g.drawText (nameB, juce::Rectangle<int> ((int) lx + 24, (int) ly - 8, 40, 16), juce::Justification::centredLeft);
+    }
 
     const float displayMinDb = rangeTable[juce::jlimit (0, 2, s.range.load())];
 
@@ -442,7 +580,7 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
     const float binHz = (float) (audioProcessor.getCurrentSampleRate() / (double) fftSize);
     const float ratio = maxFreq / minFreq;
 
-    auto buildCurve = [&] (const std::array<float, numBins>& data)
+    auto buildCurve = [&] (const Spectrum& data)
     {
         juce::Path p;
         for (int px = 0; px <= width; ++px)
@@ -458,31 +596,48 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         return p;
     };
 
-    // spectrum curve
-    juce::Path curve, filled;
+    auto closeUnder = [&] (const juce::Path& curve)
+    {
+        juce::Path p (curve);
+        p.lineTo (plot.getRight(), plot.getBottom());
+        p.lineTo (plot.getX(), plot.getBottom());
+        p.closeSubPath();
+        return p;
+    };
+
+    // spectrum curves
+    juce::Path curveA, curveB;
 
     if (width >= 2)
     {
-        curve = buildCurve (smoothed);
+        curveA = buildCurve (smoothedA);
+        const auto filledA = closeUnder (curveA);
 
-        filled = curve;
-        filled.lineTo (plot.getRight(), plot.getBottom());
-        filled.lineTo (plot.getX(), plot.getBottom());
-        filled.closeSubPath();
-
-        // fill under the curve
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
 
         const int fillStyle = s.fillStyle.load();
 
+        // curve B: soft fill underneath
+        if (mode != 0)
+        {
+            curveB = buildCurve (smoothedB);
+
+            if (fillStyle != 2)
+            {
+                g.setGradientFill (makeHorizontalGradient (plot, 0.2f, true));
+                g.fillPath (closeUnder (curveB));
+            }
+        }
+
+        // curve A: fill under the curve
         if (fillStyle == 0)          // gradient: strong colour on top, fades into the background
         {
             g.setGradientFill (makeHorizontalGradient (plot, 0.75f));
-            g.fillPath (filled);
+            g.fillPath (filledA);
 
             juce::Graphics::ScopedSaveState inner (g);
-            g.reduceClipRegion (filled, juce::AffineTransform());
+            g.reduceClipRegion (filledA, juce::AffineTransform());
             g.setGradientFill (juce::ColourGradient (bg.withAlpha (0.0f), 0.0f, plot.getY(),
                                                      bg.withAlpha (0.96f), 0.0f, plot.getBottom(), false));
             g.fillRect (plot);
@@ -490,7 +645,7 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         else if (fillStyle == 1)     // solid
         {
             g.setGradientFill (makeHorizontalGradient (plot, 0.35f));
-            g.fillPath (filled);
+            g.fillPath (filledA);
         }
     }
 
@@ -519,27 +674,42 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
                     juce::Justification::centredRight);
     }
 
-    // curve line
+    // curve lines: A solid, B dashed
     if (width >= 2)
     {
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
+
         g.setGradientFill (makeHorizontalGradient (plot, 1.0f));
-        g.strokePath (curve, juce::PathStrokeType (s.lineThickness.load()));
+        g.strokePath (curveA, juce::PathStrokeType (s.lineThickness.load()));
+
+        if (mode != 0)
+        {
+            const float dashes[] = { 5.0f, 3.0f };
+            juce::Path dashed;
+            juce::PathStrokeType (s.lineThickness.load()).createDashedStroke (dashed, curveB, dashes, 2);
+            g.setGradientFill (makeHorizontalGradient (plot, 1.0f, true));
+            g.fillPath (dashed);
+        }
     }
 
-    // peak hold line
+    // peak hold lines
     if (width >= 2 && s.peakHold.load())
     {
-        const auto peakCurve = buildCurve (peaks);
-
         juce::Graphics::ScopedSaveState state (g);
         g.reduceClipRegion (plot.toNearestInt());
+
         g.setColour (juce::Colours::white.withAlpha (0.55f));
-        g.strokePath (peakCurve, juce::PathStrokeType (1.0f));
+        g.strokePath (buildCurve (peaksA), juce::PathStrokeType (1.0f));
+
+        if (mode != 0)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.35f));
+            g.strokePath (buildCurve (peaksB), juce::PathStrokeType (1.0f));
+        }
     }
 
-    // hover readout: frequency, note and level
+    // hover readout: frequency, note and level(s)
     if (hoverActive && width >= 2)
     {
         const float x = juce::jlimit (plot.getX(), plot.getRight(), hoverPos.x);
@@ -547,16 +717,23 @@ void SpectrumAnalyzerEditor::paint (juce::Graphics& g)
         const float t1 = t0 + 1.0f / (float) width;
         const float f0 = minFreq * std::pow (ratio, t0);
         const float f1 = minFreq * std::pow (ratio, t1);
-        const float y = juce::jlimit (plot.getY(), plot.getBottom(), yForDb (levelAt (smoothed, f0, f1, binHz)));
+        const float yA = juce::jlimit (plot.getY(), plot.getBottom(), yForDb (levelAt (smoothedA, f0, f1, binHz)));
 
-        // vertical line and dot on the curve
+        // vertical line and dot(s) on the curve(s)
         g.setColour (juce::Colours::white.withAlpha (0.3f));
         g.drawVerticalLine ((int) x, plot.getY(), plot.getBottom());
         g.setColour (juce::Colours::white);
-        g.fillEllipse (x - 3.5f, y - 3.5f, 7.0f, 7.0f);
+        g.fillEllipse (x - 3.5f, yA - 3.5f, 7.0f, 7.0f);
+
+        if (mode != 0)
+        {
+            const float yB = juce::jlimit (plot.getY(), plot.getBottom(), yForDb (levelAt (smoothedB, f0, f1, binHz)));
+            g.setColour (juce::Colours::white.withAlpha (0.6f));
+            g.fillEllipse (x - 3.0f, yB - 3.0f, 6.0f, 6.0f);
+        }
 
         // box follows the mouse (not the curve), so it does not jump
-        juce::Rectangle<float> box (0.0f, 0.0f, 134.0f, 40.0f);
+        juce::Rectangle<float> box (0.0f, 0.0f, mode != 0 ? 210.0f : 134.0f, 40.0f);
         float bx = hoverPos.x + 16.0f;
         if (bx + box.getWidth() > plot.getRight())
             bx = hoverPos.x - 16.0f - box.getWidth();

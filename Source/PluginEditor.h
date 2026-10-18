@@ -3,6 +3,7 @@
 #include <juce_dsp/juce_dsp.h>
 #include <array>
 #include <functional>
+#include <memory>
 #include <vector>
 
 // Row of colour circles: click one to pick a colour
@@ -142,32 +143,45 @@ public:
     void mouseExit (const juce::MouseEvent&) override;
 
 private:
-    static constexpr int fftSize = SpectrumAnalyzerProcessor::fftSize;
-    static constexpr int numBins = fftSize / 2;
+    static constexpr int maxFftSize = SpectrumAnalyzerProcessor::maxFftSize;
+    static constexpr int maxBins = maxFftSize / 2;
+    using Spectrum = std::array<float, maxBins>;
 
     void timerCallback() override;
-    float levelAt (const std::array<float, numBins>& data, float f0, float f1, float binHz) const;
-    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha) const;
+    void rebuildFft (int newSize);
+    void updateSpectrum (const float* samples, Spectrum& smoothedOut, Spectrum& peaksOut,
+                         float attack, float release, bool peaksOn);
+    float levelAt (const Spectrum& data, float f0, float f1, float binHz) const;
+    juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> plot, float alpha, bool secondary = false) const;
     juce::Rectangle<float> getPlotBounds() const;
     void updateSwatchSelection();
     void setPanelVisible (bool shouldBeVisible);
 
     SpectrumAnalyzerProcessor& audioProcessor;
-    juce::dsp::FFT fft;
-    juce::dsp::WindowingFunction<float> window;
-    std::array<float, fftSize * 2> fftData {};
-    std::array<float, numBins> smoothed {};
-    std::array<float, numBins> peaks {};
+
+    // current analysis size (changes with the "FFT size" setting)
+    int fftSize = 4096;
+    int numBins = 2048;
+    std::unique_ptr<juce::dsp::FFT> fft;
+    std::unique_ptr<juce::dsp::WindowingFunction<float>> window;
+
+    std::array<float, maxFftSize * 2> fftData {};
+    std::array<float, maxFftSize> bufL {};
+    std::array<float, maxFftSize> bufR {};
+
+    // curve A = mix / left / mid, curve B = right / side
+    Spectrum smoothedA {}, smoothedB {}, peaksA {}, peaksB {};
+    int lastStereoMode = 0;
 
     // settings panel
     GearButton settingsButton;
-    juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox;
+    juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox, channelsBox, fftBox;
     SwatchRow swatches;
     juce::Slider hueSlider, thicknessSlider;
     juce::ToggleButton animateToggle, peakToggle;
     juce::Rectangle<int> panelBounds;
-    std::array<juce::Rectangle<int>, 8> labelRects;
-    std::array<juce::String, 8> labelTexts;
+    std::array<juce::Rectangle<int>, 10> labelRects;
+    std::array<juce::String, 10> labelTexts;
 
     float hueOffset = 0.0f;
 
@@ -177,7 +191,8 @@ private:
 
     // readout text (stabilised so it does not jitter)
     juce::String readoutLine1, readoutLine2;
-    float readoutLevel = -120.0f;
+    float readoutLevelA = -120.0f;
+    float readoutLevelB = -120.0f;
     float lastReadoutX = -1.0f;
     int readoutTick = 0;
 

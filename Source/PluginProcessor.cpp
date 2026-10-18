@@ -6,7 +6,9 @@ SpectrumAnalyzerProcessor::SpectrumAnalyzerProcessor()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
-    for (auto& s : ring)
+    for (auto& s : ringL)
+        s.store (0.0f);
+    for (auto& s : ringR)
         s.store (0.0f);
 }
 
@@ -33,29 +35,31 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
     if (numChannels == 0 || numSamples == 0)
         return;
 
+    const float* left  = buffer.getReadPointer (0);
+    const float* right = numChannels > 1 ? buffer.getReadPointer (1) : left;
+
     int index = writeIndex.load (std::memory_order_relaxed);
 
-    // Junta os canais num so (media) e guarda no buffer circular.
-    // O som NAO e alterado: o plugin so "olha" para ele.
+    // Keeps the latest left and right samples in two circular buffers.
+    // The sound is NOT changed: the plugin only "looks" at it.
     for (int i = 0; i < numSamples; ++i)
     {
-        float sum = 0.0f;
-        for (int ch = 0; ch < numChannels; ++ch)
-            sum += buffer.getReadPointer (ch)[i];
-
-        ring[(size_t) index].store (sum / (float) numChannels, std::memory_order_relaxed);
-        index = (index + 1) & (fftSize - 1);
+        ringL[(size_t) index].store (left[i],  std::memory_order_relaxed);
+        ringR[(size_t) index].store (right[i], std::memory_order_relaxed);
+        index = (index + 1) & (maxFftSize - 1);
     }
 
     writeIndex.store (index, std::memory_order_release);
 }
 
-void SpectrumAnalyzerProcessor::copyLatestSamples (float* destination) const
+void SpectrumAnalyzerProcessor::copyLatestSamples (float* destination, int channel, int count) const
 {
+    const auto& ring = (channel == 0) ? ringL : ringR;
     const int start = writeIndex.load (std::memory_order_acquire);
 
-    for (int i = 0; i < fftSize; ++i)
-        destination[i] = ring[(size_t) ((start + i) & (fftSize - 1))].load (std::memory_order_relaxed);
+    for (int i = 0; i < count; ++i)
+        destination[i] = ring[(size_t) ((start - count + i + maxFftSize) & (maxFftSize - 1))]
+                             .load (std::memory_order_relaxed);
 }
 
 void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData)
@@ -71,6 +75,8 @@ void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData
     xml.setAttribute ("tilt",          settings.tilt.load());
     xml.setAttribute ("speed",         settings.speed.load());
     xml.setAttribute ("range",         settings.range.load());
+    xml.setAttribute ("stereoMode",    settings.stereoMode.load());
+    xml.setAttribute ("fftSizeIndex",  settings.fftSizeIndex.load());
     copyXmlToBinary (xml, destData);
 }
 
@@ -90,6 +96,8 @@ void SpectrumAnalyzerProcessor::setStateInformation (const void* data, int sizeI
             settings.tilt          = xml->getIntAttribute ("tilt", 0);
             settings.speed         = xml->getIntAttribute ("speed", 1);
             settings.range         = xml->getIntAttribute ("range", 1);
+            settings.stereoMode    = xml->getIntAttribute ("stereoMode", 0);
+            settings.fftSizeIndex  = xml->getIntAttribute ("fftSizeIndex", 1);
         }
     }
 }
