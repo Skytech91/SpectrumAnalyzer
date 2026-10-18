@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <array>
 #include <atomic>
+#include <cstdint>
 
 // Parte "de audio": recebe o som, guarda as ultimas amostras e deixa o som passar intacto.
 class SpectrumAnalyzerProcessor : public juce::AudioProcessor
@@ -33,12 +34,24 @@ public:
     const juce::String getProgramName (int) override { return {}; }
     void changeProgramName (int, const juce::String&) override {}
 
-    void getStateInformation (juce::MemoryBlock&) override {}
-    void setStateInformation (const void*, int) override {}
+    // Guarda/le as definicoes visuais no projeto da DAW
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
 
     // Usado pela interface para ler as ultimas amostras (da mais antiga para a mais recente)
     void copyLatestSamples (float* destination) const;
     double getCurrentSampleRate() const { return currentSampleRate.load(); }
+
+    // Definicoes visuais (mudadas na interface, guardadas com o projeto)
+    struct Settings
+    {
+        std::atomic<int>      colourMode    { 0 };            // 0 = cor unica, 1 = arco-iris
+        std::atomic<uint32_t> singleColour  { 0xff35e0c2 };
+        std::atomic<int>      fillStyle     { 0 };            // 0 = gradiente, 1 = solido, 2 = so linha
+        std::atomic<float>    lineThickness { 1.6f };
+        std::atomic<int>      background    { 0 };            // 0..3
+        std::atomic<bool>     animate       { false };
+    } settings;
 
 private:
     std::array<std::atomic<float>, fftSize> ring;

@@ -58,6 +58,34 @@ void SpectrumAnalyzerProcessor::copyLatestSamples (float* destination) const
         destination[i] = ring[(size_t) ((start + i) & (fftSize - 1))].load (std::memory_order_relaxed);
 }
 
+void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    juce::XmlElement xml ("MugenSpectrumSettings");
+    xml.setAttribute ("colourMode",    settings.colourMode.load());
+    xml.setAttribute ("singleColour",  juce::Colour (settings.singleColour.load()).toString());
+    xml.setAttribute ("fillStyle",     settings.fillStyle.load());
+    xml.setAttribute ("lineThickness", (double) settings.lineThickness.load());
+    xml.setAttribute ("background",    settings.background.load());
+    xml.setAttribute ("animate",       settings.animate.load() ? 1 : 0);
+    copyXmlToBinary (xml, destData);
+}
+
+void SpectrumAnalyzerProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+    {
+        if (xml->hasTagName ("MugenSpectrumSettings"))
+        {
+            settings.colourMode    = xml->getIntAttribute ("colourMode", 0);
+            settings.singleColour  = juce::Colour::fromString (xml->getStringAttribute ("singleColour", "ff35e0c2")).getARGB();
+            settings.fillStyle     = xml->getIntAttribute ("fillStyle", 0);
+            settings.lineThickness = (float) xml->getDoubleAttribute ("lineThickness", 1.6);
+            settings.background    = xml->getIntAttribute ("background", 0);
+            settings.animate       = xml->getIntAttribute ("animate", 0) != 0;
+        }
+    }
+}
+
 juce::AudioProcessorEditor* SpectrumAnalyzerProcessor::createEditor()
 {
     return new SpectrumAnalyzerEditor (*this);
