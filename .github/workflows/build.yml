@@ -1,0 +1,42 @@
+name: Compilar plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: Mac
+          - os: windows-latest
+            name: Windows
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
+
+      - name: Empacotar (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          cd build/SpectrumAnalyzer_artefacts/Release/VST3
+          codesign --force --deep -s - *.vst3
+          zip -r -y "$GITHUB_WORKSPACE/SpectrumAnalyzer-Mac-VST3.zip" *.vst3
+
+      - name: Empacotar (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "build/SpectrumAnalyzer_artefacts/Release/VST3/*" -DestinationPath SpectrumAnalyzer-Windows-VST3.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpectrumAnalyzer-${{ matrix.name }}
+          path: SpectrumAnalyzer-*-VST3.zip
