@@ -6,16 +6,18 @@
 #include <memory>
 #include <vector>
 
-// Row of colour circles: click one to pick a colour
+// Row of colour circles: click one to pick a colour. Colours that are not allowed are crossed out.
 class SwatchRow : public juce::Component
 {
 public:
-    SwatchRow()
+    static const std::vector<juce::Colour>& palette()
     {
-        colours = { juce::Colour (0xff35e0c2), juce::Colour (0xff3aa0ff), juce::Colour (0xff8a5cff),
-                    juce::Colour (0xffff4fb8), juce::Colour (0xffff4d4d), juce::Colour (0xffff9a3c),
-                    juce::Colour (0xffffd84a), juce::Colour (0xff7be04a), juce::Colour (0xffffffff),
-                    juce::Colour (0xff9aa5b1) };
+        static const std::vector<juce::Colour> colours = {
+            juce::Colour (0xff35e0c2), juce::Colour (0xff3aa0ff), juce::Colour (0xff8a5cff),
+            juce::Colour (0xffff4fb8), juce::Colour (0xffff4d4d), juce::Colour (0xffff9a3c),
+            juce::Colour (0xffffd84a), juce::Colour (0xff7be04a), juce::Colour (0xffffffff),
+            juce::Colour (0xff9aa5b1) };
+        return colours;
     }
 
     std::function<void (juce::Colour)> onPick;
@@ -23,8 +25,8 @@ public:
     void setSelectedFromColour (juce::Colour c)
     {
         selected = -1;
-        for (size_t i = 0; i < colours.size(); ++i)
-            if (colours[i].getARGB() == c.getARGB())
+        for (size_t i = 0; i < palette().size(); ++i)
+            if (palette()[i].getARGB() == c.getARGB())
                 selected = (int) i;
         repaint();
     }
@@ -35,13 +37,27 @@ public:
         repaint();
     }
 
+    void setDisabledColours (std::vector<juce::Colour> colours)
+    {
+        disabled = std::move (colours);
+        repaint();
+    }
+
     void paint (juce::Graphics& g) override
     {
-        for (size_t i = 0; i < colours.size(); ++i)
+        for (size_t i = 0; i < palette().size(); ++i)
         {
             const auto r = swatchBounds ((int) i);
-            g.setColour (colours[i]);
+            const bool off = isDisabled ((int) i);
+
+            g.setColour (palette()[i].withAlpha (off ? 0.25f : 1.0f));
             g.fillEllipse (r);
+
+            if (off)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.6f));
+                g.drawLine (r.getX() + 2.0f, r.getBottom() - 2.0f, r.getRight() - 2.0f, r.getY() + 2.0f, 1.2f);
+            }
 
             if ((int) i == selected)
             {
@@ -53,13 +69,16 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        for (size_t i = 0; i < colours.size(); ++i)
+        for (size_t i = 0; i < palette().size(); ++i)
         {
             if (swatchBounds ((int) i).expanded (2.0f).contains (e.position))
             {
+                if (isDisabled ((int) i))
+                    return;
+
                 selected = (int) i;
                 if (onPick)
-                    onPick (colours[i]);
+                    onPick (palette()[i]);
                 repaint();
                 return;
             }
@@ -67,14 +86,22 @@ public:
     }
 
 private:
+    bool isDisabled (int i) const
+    {
+        for (const auto& d : disabled)
+            if (d.getARGB() == palette()[(size_t) i].getARGB())
+                return true;
+        return false;
+    }
+
     juce::Rectangle<float> swatchBounds (int i) const
     {
-        const float slot = (float) getWidth() / (float) colours.size();
+        const float slot = (float) getWidth() / (float) palette().size();
         const float d = juce::jmin (slot - 5.0f, (float) getHeight() - 6.0f);
         return { (float) i * slot + (slot - d) * 0.5f, ((float) getHeight() - d) * 0.5f, d, d };
     }
 
-    std::vector<juce::Colour> colours;
+    std::vector<juce::Colour> disabled;
     int selected = -1;
 };
 
@@ -126,7 +153,37 @@ public:
     }
 };
 
-// Visual part: spectrum analyzer (top), scope and loudness meter (bottom strip), settings panel.
+// Small rounded on/off button used in the header to show or hide a section
+class PillToggle : public juce::Button
+{
+public:
+    explicit PillToggle (const juce::String& text) : juce::Button (text)
+    {
+        setButtonText (text);
+        setClickingTogglesState (true);
+    }
+
+    void paintButton (juce::Graphics& g, bool isMouseOver, bool) override
+    {
+        const auto b = getLocalBounds().toFloat().reduced (0.5f);
+        const bool on = getToggleState();
+
+        auto bg = on ? juce::Colour (0xff3a4654) : juce::Colour (0xff1b2128);
+        if (isMouseOver)
+            bg = bg.brighter (0.1f);
+
+        g.setColour (bg);
+        g.fillRoundedRectangle (b, b.getHeight() * 0.5f);
+        g.setColour (juce::Colours::white.withAlpha (on ? 0.35f : 0.15f));
+        g.drawRoundedRectangle (b, b.getHeight() * 0.5f, 1.0f);
+
+        g.setColour (juce::Colours::white.withAlpha (on ? 0.95f : 0.5f));
+        g.setFont (12.0f);
+        g.drawText (getButtonText(), getLocalBounds(), juce::Justification::centred);
+    }
+};
+
+// Visual part: spectrum analyzer, scope, loudness meters and the settings panel.
 class SpectrumAnalyzerEditor : public juce::AudioProcessorEditor,
                                private juce::Timer
 {
@@ -146,6 +203,7 @@ private:
     static constexpr int maxFftSize = SpectrumAnalyzerProcessor::maxFftSize;
     static constexpr int maxBins = maxFftSize / 2;
     using Spectrum = std::array<float, maxBins>;
+    using ScopeBuffer = std::array<float, SpectrumAnalyzerProcessor::scopeRingSize / 2>;
 
     void timerCallback() override;
     void rebuildFft (int newSize);
@@ -155,17 +213,21 @@ private:
     float levelAt (const Spectrum& data, float f0, float f1, float binHz) const;
     juce::ColourGradient makeHorizontalGradient (juce::Rectangle<float> area, float alpha) const;
 
-    // layout
-    float getStripHeight() const;
+    // layout (the analyzer, the scope and the meters share the window)
+    juce::Rectangle<float> getContentBounds() const;
+    juce::Rectangle<float> getMainArea() const;
+    float getScopeHeight (juce::Rectangle<float> mainArea) const;
+    juce::Rectangle<float> getAnalyzerArea() const;
     juce::Rectangle<float> getPlotBounds() const;
-    juce::Rectangle<float> getStripArea() const;
     juce::Rectangle<float> getScopeBounds() const;
-    juce::Rectangle<float> getLoudnessBounds() const;
+    juce::Rectangle<float> getMetersBounds() const;
     juce::Rectangle<int> getResetRect() const;
 
+    void drawAnalyzer (juce::Graphics& g);
     void drawScope (juce::Graphics& g, juce::Rectangle<float> area);
-    void drawLoudness (juce::Graphics& g, juce::Rectangle<float> area);
+    void drawMeters (juce::Graphics& g, juce::Rectangle<float> area);
 
+    void enforceDistinctColours();
     void updateSwatchSelection();
     void updatePanelVisibility();
 
@@ -185,24 +247,32 @@ private:
     Spectrum smoothedA {}, smoothedB {}, peaksA {}, peaksB {};
     int lastStereoMode = 0;
 
-    // scope
-    std::array<float, maxFftSize> scopeWork {};
-    std::array<float, maxFftSize / 2> scopeData {};
+    // scope: input (bass) and sidechain (kick)
+    ScopeBuffer scopeData {}, scopeDataSide {};
     int scopeCount = 0;
+    int scopeFilled = 0;
+    bool scopeSynced = false;
+    bool scopeSideActive = false;
+    juce::String scopeLabel;
+
+    // header: show / hide sections
+    PillToggle analyzerPill { juce::String ("Analyzer") };
+    PillToggle scopePill    { juce::String ("Scope") };
+    PillToggle metersPill   { juce::String ("Meters") };
 
     // settings panel
     GearButton settingsButton;
-    juce::TextButton tabLook, tabAnalyzer, tabScope;
+    juce::TextButton tabLook, tabAnalyzer, tabScope, tabMeter;
     int panelPage = 0;
 
     juce::ComboBox modeBox, fillBox, backgroundBox, tiltBox, speedBox, rangeBox, channelsBox, fftBox,
-                   scopeTimeBox, scopeFilterBox;
-    SwatchRow swatches, swatchesStereoA, swatchesB;
+                   scopeTimeBox, scopeFilterBox, meterModeBox;
+    SwatchRow swatches, swatchesStereoA, swatchesB, swatchesScopeA, swatchesScopeB, swatchesMeter;
     juce::Slider hueSlider, thicknessSlider;
-    juce::ToggleButton animateToggle, peakToggle, scopeToggle, loudnessToggle;
-    juce::Rectangle<int> panelBounds;
-    std::array<juce::Rectangle<int>, 13> labelRects;
-    std::array<juce::String, 13> labelTexts;
+    juce::ToggleButton animateToggle, peakToggle;
+    juce::Rectangle<int> panelBounds, scopeHintRect;
+    std::array<juce::Rectangle<int>, 16> labelRects;
+    std::array<juce::String, 16> labelTexts;
 
     // legend (two-curve modes): click a name to hide / show that curve
     juce::Rectangle<int> legendA, legendB;

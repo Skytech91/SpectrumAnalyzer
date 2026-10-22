@@ -3,12 +3,17 @@
 
 SpectrumAnalyzerProcessor::SpectrumAnalyzerProcessor()
     : AudioProcessor (BusesProperties()
-                          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+                          .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
+                          .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
+                          .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false))
 {
     for (auto& s : ringL)
         s.store (0.0f);
     for (auto& s : ringR)
+        s.store (0.0f);
+    for (auto& s : scopeRingMain)
+        s.store (0.0f);
+    for (auto& s : scopeRingSide)
         s.store (0.0f);
 
     setupKFilter (44100.0);
@@ -17,6 +22,15 @@ SpectrumAnalyzerProcessor::SpectrumAnalyzerProcessor()
 void SpectrumAnalyzerProcessor::prepareToPlay (double sampleRate, int)
 {
     currentSampleRate = sampleRate;
+    scopeDecimation = juce::jmax (1, (int) std::lround (sampleRate / 6000.0));   // scope runs at about 6 kHz
+    appliedScopeFilter = -1;                                                      // redesign the scope filters
+
+    for (int i = 0; i < 2; ++i)
+    {
+        scopeLpMain[i].reset();
+        scopeLpSide[i].reset();
+    }
+
     subBlockLength = juce::jmax (1, (int) std::lround (0.1 * sampleRate));
     setupKFilter (sampleRate);
     resetLoudnessState();
@@ -24,11 +38,18 @@ void SpectrumAnalyzerProcessor::prepareToPlay (double sampleRate, int)
 
 bool SpectrumAnalyzerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    const auto out = layouts.getMainOutputChannelSet();
-    if (out != juce::AudioChannelSet::mono() && out != juce::AudioChannelSet::stereo())
+    const auto mainOut = layouts.getMainOutputChannelSet();
+    if (mainOut != juce::AudioChannelSet::mono() && mainOut != juce::AudioChannelSet::stereo())
         return false;
 
-    return out == layouts.getMainInputChannelSet();
+    if (mainOut != layouts.getMainInputChannelSet())
+        return false;
+
+    // the sidechain input may be off, mono or stereo
+    const auto sidechain = layouts.getChannelSet (true, 1);
+    return sidechain.isDisabled()
+        || sidechain == juce::AudioChannelSet::mono()
+        || sidechain == juce::AudioChannelSet::stereo();
 }
 
 // K-weighting filters from ITU-R BS.1770 (shelving filter + high-pass), for any sample rate
@@ -168,29 +189,125 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 {
     juce::ScopedNoDenormals noDenormals;
 
-    const int numChannels = buffer.getNumChannels();
-    const int numSamples  = buffer.getNumSamples();
+    // main input (the sidechain, if any, sits in extra channels of the same buffer)
+    auto mainBuffer = getBusBuffer (buffer, true, 0);
+    const int numChannels = mainBuffer.getNumChannels();
+    const int numSamples  = mainBuffer.getNumSamples();
     if (numChannels == 0 || numSamples == 0)
         return;
 
     if (resetLoudnessRequested.exchange (false))
         resetLoudnessState();
 
-    const float* left  = buffer.getReadPointer (0);
-    const float* right = numChannels > 1 ? buffer.getReadPointer (1) : left;
+    const float* left  = mainBuffer.getReadPointer (0);
+    const float* right = numChannels > 1 ? mainBuffer.getReadPointer (1) : left;
 
-    int index = writeIndex.load (std::memory_order_relaxed);
+    // sidechain input (for example the kick drum)
+    const float* sideLeft = nullptr;
+    const float* sideRight = nullptr;
+    bool sidechainOn = false;
 
-    // Keeps the latest left and right samples in two circular buffers.
-    // The sound is NOT changed: the plugin only "looks" at it.
-    for (int i = 0; i < numSamples; ++i)
+    if (getBusCount (true) > 1)
     {
-        ringL[(size_t) index].store (left[i],  std::memory_order_relaxed);
-        ringR[(size_t) index].store (right[i], std::memory_order_relaxed);
-        index = (index + 1) & (maxFftSize - 1);
+        if (auto* sideBus = getBus (true, 1))
+        {
+            if (sideBus->isEnabled())
+            {
+                auto sideBuffer = getBusBuffer (buffer, true, 1);
+
+                if (sideBuffer.getNumChannels() > 0)
+                {
+                    sideLeft  = sideBuffer.getReadPointer (0);
+                    sideRight = sideBuffer.getNumChannels() > 1 ? sideBuffer.getReadPointer (1) : sideLeft;
+                    sidechainOn = true;
+                }
+            }
+        }
     }
 
-    writeIndex.store (index, std::memory_order_release);
+    sidechainActive.store (sidechainOn);
+
+    // scope filters: redesign when the setting changes
+    const int wantedFilter = juce::jlimit (0, numScopeFilters - 1, settings.scopeFilter.load());
+    if (wantedFilter != appliedScopeFilter)
+    {
+        const double fs = currentSampleRate.load();
+        const double cutoff = juce::jmin ((double) scopeCutoffs[wantedFilter], 0.45 * fs);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            designLowpassBiquad (scopeLpMain[i], fs, cutoff, 0.70710678);
+            designLowpassBiquad (scopeLpSide[i], fs, cutoff, 0.70710678);
+        }
+
+        appliedScopeFilter = wantedFilter;
+    }
+
+    // tempo and position from the DAW (used to line the scope up with the beat)
+    const int64_t absStart = absWrite.load (std::memory_order_relaxed);
+
+    {
+        HostInfo info;
+        info.absStart = absStart;
+
+        if (auto* playHead = getPlayHead())
+        {
+            if (auto position = playHead->getPosition())
+            {
+                if (auto ppq = position->getPpqPosition())
+                {
+                    info.valid = true;
+                    info.ppqStart = *ppq;
+                }
+
+                if (auto bpm = position->getBpm())
+                    info.bpm = *bpm;
+
+                info.playing = position->getIsPlaying();
+
+                if (auto signature = position->getTimeSignature())
+                {
+                    info.sigNum = signature->numerator;
+                    info.sigDen = signature->denominator;
+                }
+            }
+        }
+
+        const juce::SpinLock::ScopedTryLockType lock (hostLock);
+        if (lock.isLocked())
+            hostInfo = info;
+    }
+
+    // Keeps the latest samples in circular buffers. The sound is NOT changed.
+    const int decimation = scopeDecimation.load();
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const int64_t a = absStart + i;
+
+        ringL[(size_t) (a & (maxFftSize - 1))].store (left[i],  std::memory_order_relaxed);
+        ringR[(size_t) (a & (maxFftSize - 1))].store (right[i], std::memory_order_relaxed);
+
+        // scope signals: mono sum, low-passed
+        const double inputMono = 0.5 * ((double) left[i] + (double) right[i]);
+        const double inputFiltered = scopeLpMain[1].process (scopeLpMain[0].process (inputMono));
+
+        double sideFiltered = 0.0;
+        if (sidechainOn)
+        {
+            const double sideMono = 0.5 * ((double) sideLeft[i] + (double) sideRight[i]);
+            sideFiltered = scopeLpSide[1].process (scopeLpSide[0].process (sideMono));
+        }
+
+        if ((a % decimation) == 0)
+        {
+            const size_t k = (size_t) ((a / decimation) & (scopeRingSize - 1));
+            scopeRingMain[k].store ((float) inputFiltered, std::memory_order_relaxed);
+            scopeRingSide[k].store ((float) sideFiltered,  std::memory_order_relaxed);
+        }
+    }
+
+    absWrite.store (absStart + numSamples, std::memory_order_release);
 
     // Loudness: K-weighting, then the energy is collected in 100 ms blocks
     const int measuredChannels = (numChannels > 1) ? 2 : 1;
@@ -220,34 +337,39 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 void SpectrumAnalyzerProcessor::copyLatestSamples (float* destination, int channel, int count) const
 {
     const auto& ring = (channel == 0) ? ringL : ringR;
-    const int start = writeIndex.load (std::memory_order_acquire);
+    const int64_t end = absWrite.load (std::memory_order_acquire);
 
     for (int i = 0; i < count; ++i)
-        destination[i] = ring[(size_t) ((start - count + i + maxFftSize) & (maxFftSize - 1))]
+        destination[i] = ring[(size_t) ((end - count + i + maxFftSize) & (maxFftSize - 1))]
                              .load (std::memory_order_relaxed);
 }
 
 void SpectrumAnalyzerProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::XmlElement xml ("MugenSpectrumSettings");
-    xml.setAttribute ("colourMode",     settings.colourMode.load());
-    xml.setAttribute ("singleColour",   juce::Colour (settings.singleColour.load()).toString());
-    xml.setAttribute ("colourStereoA",  juce::Colour (settings.colourStereoA.load()).toString());
-    xml.setAttribute ("colourB",        juce::Colour (settings.colourB.load()).toString());
-    xml.setAttribute ("fillStyle",      settings.fillStyle.load());
-    xml.setAttribute ("lineThickness",  (double) settings.lineThickness.load());
-    xml.setAttribute ("background",     settings.background.load());
-    xml.setAttribute ("animate",        settings.animate.load() ? 1 : 0);
-    xml.setAttribute ("peakHold",       settings.peakHold.load() ? 1 : 0);
-    xml.setAttribute ("tilt",           settings.tilt.load());
-    xml.setAttribute ("speed",          settings.speed.load());
-    xml.setAttribute ("range",          settings.range.load());
-    xml.setAttribute ("stereoMode",     settings.stereoMode.load());
-    xml.setAttribute ("fftSizeIndex",   settings.fftSizeIndex.load());
-    xml.setAttribute ("showScope",      settings.showScope.load() ? 1 : 0);
-    xml.setAttribute ("scopeTime",      settings.scopeTime.load());
-    xml.setAttribute ("scopeFilter",    settings.scopeFilter.load());
-    xml.setAttribute ("showLoudness",   settings.showLoudness.load() ? 1 : 0);
+    xml.setAttribute ("colourMode",      settings.colourMode.load());
+    xml.setAttribute ("singleColour",    juce::Colour (settings.singleColour.load()).toString());
+    xml.setAttribute ("colourStereoA",   juce::Colour (settings.colourStereoA.load()).toString());
+    xml.setAttribute ("colourB",         juce::Colour (settings.colourB.load()).toString());
+    xml.setAttribute ("fillStyle",       settings.fillStyle.load());
+    xml.setAttribute ("lineThickness",   (double) settings.lineThickness.load());
+    xml.setAttribute ("background",      settings.background.load());
+    xml.setAttribute ("animate",         settings.animate.load() ? 1 : 0);
+    xml.setAttribute ("peakHold",        settings.peakHold.load() ? 1 : 0);
+    xml.setAttribute ("tilt",            settings.tilt.load());
+    xml.setAttribute ("speed",           settings.speed.load());
+    xml.setAttribute ("range",           settings.range.load());
+    xml.setAttribute ("stereoMode",      settings.stereoMode.load());
+    xml.setAttribute ("fftSizeIndex",    settings.fftSizeIndex.load());
+    xml.setAttribute ("showAnalyzer",    settings.showAnalyzer.load() ? 1 : 0);
+    xml.setAttribute ("showScope",       settings.showScope.load() ? 1 : 0);
+    xml.setAttribute ("showLoudness",    settings.showLoudness.load() ? 1 : 0);
+    xml.setAttribute ("scopeTime",       settings.scopeTime.load());
+    xml.setAttribute ("scopeFilter",     settings.scopeFilter.load());
+    xml.setAttribute ("scopeColour",     juce::Colour (settings.scopeColour.load()).toString());
+    xml.setAttribute ("scopeColourSide", juce::Colour (settings.scopeColourSide.load()).toString());
+    xml.setAttribute ("meterMode",       settings.meterMode.load());
+    xml.setAttribute ("meterColour",     juce::Colour (settings.meterColour.load()).toString());
     copyXmlToBinary (xml, destData);
 }
 
@@ -257,24 +379,34 @@ void SpectrumAnalyzerProcessor::setStateInformation (const void* data, int sizeI
     {
         if (xml->hasTagName ("MugenSpectrumSettings"))
         {
-            settings.colourMode    = xml->getIntAttribute ("colourMode", 0);
-            settings.singleColour  = juce::Colour::fromString (xml->getStringAttribute ("singleColour", "ff35e0c2")).getARGB();
-            settings.colourStereoA = juce::Colour::fromString (xml->getStringAttribute ("colourStereoA", "ff35e0c2")).getARGB();
-            settings.colourB       = juce::Colour::fromString (xml->getStringAttribute ("colourB", "ffff4fb8")).getARGB();
-            settings.fillStyle     = xml->getIntAttribute ("fillStyle", 0);
-            settings.lineThickness = (float) xml->getDoubleAttribute ("lineThickness", 1.6);
-            settings.background    = xml->getIntAttribute ("background", 0);
-            settings.animate       = xml->getIntAttribute ("animate", 0) != 0;
-            settings.peakHold      = xml->getIntAttribute ("peakHold", 0) != 0;
-            settings.tilt          = xml->getIntAttribute ("tilt", 0);
-            settings.speed         = xml->getIntAttribute ("speed", 1);
-            settings.range         = xml->getIntAttribute ("range", 1);
-            settings.stereoMode    = xml->getIntAttribute ("stereoMode", 0);
-            settings.fftSizeIndex  = xml->getIntAttribute ("fftSizeIndex", 1);
-            settings.showScope     = xml->getIntAttribute ("showScope", 0) != 0;
-            settings.scopeTime     = xml->getIntAttribute ("scopeTime", 1);
-            settings.scopeFilter   = xml->getIntAttribute ("scopeFilter", 1);
-            settings.showLoudness  = xml->getIntAttribute ("showLoudness", 0) != 0;
+            auto colourOf = [&] (const char* name, const char* fallback)
+            {
+                return juce::Colour::fromString (xml->getStringAttribute (name, fallback)).getARGB();
+            };
+
+            settings.colourMode      = xml->getIntAttribute ("colourMode", 0);
+            settings.singleColour    = colourOf ("singleColour",    "ff35e0c2");
+            settings.colourStereoA   = colourOf ("colourStereoA",   "ff3aa0ff");
+            settings.colourB         = colourOf ("colourB",         "ffff4fb8");
+            settings.fillStyle       = xml->getIntAttribute ("fillStyle", 0);
+            settings.lineThickness   = (float) xml->getDoubleAttribute ("lineThickness", 1.6);
+            settings.background      = xml->getIntAttribute ("background", 0);
+            settings.animate         = xml->getIntAttribute ("animate", 0) != 0;
+            settings.peakHold        = xml->getIntAttribute ("peakHold", 0) != 0;
+            settings.tilt            = xml->getIntAttribute ("tilt", 0);
+            settings.speed           = xml->getIntAttribute ("speed", 1);
+            settings.range           = xml->getIntAttribute ("range", 1);
+            settings.stereoMode      = xml->getIntAttribute ("stereoMode", 0);
+            settings.fftSizeIndex    = xml->getIntAttribute ("fftSizeIndex", 1);
+            settings.showAnalyzer    = xml->getIntAttribute ("showAnalyzer", 1) != 0;
+            settings.showScope       = xml->getIntAttribute ("showScope", 0) != 0;
+            settings.showLoudness    = xml->getIntAttribute ("showLoudness", 0) != 0;
+            settings.scopeTime       = xml->getIntAttribute ("scopeTime", 10);
+            settings.scopeFilter     = xml->getIntAttribute ("scopeFilter", 2);
+            settings.scopeColour     = colourOf ("scopeColour",     "ff35e0c2");
+            settings.scopeColourSide = colourOf ("scopeColourSide", "ffff9a3c");
+            settings.meterMode       = xml->getIntAttribute ("meterMode", 0);
+            settings.meterColour     = colourOf ("meterColour",     "ff7be04a");
         }
     }
 }
