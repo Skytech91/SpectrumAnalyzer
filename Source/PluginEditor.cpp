@@ -52,6 +52,29 @@ namespace
         return juce::String (names[index]) + juce::String (octave);
     }
 
+    // colour of a meter segment: green (low) -> yellow -> orange -> red (0 dB, clipping)
+    juce::Colour colourForDb (float db)
+    {
+        struct Stop { float db; juce::uint32 argb; };
+        static const Stop stops[] = { { -48.0f, 0xff1fc86e }, { -24.0f, 0xff63d84a }, { -14.0f, 0xffc4e04a },
+                                      { -9.0f,  0xffffd84a }, { -5.0f,  0xffff9a3c }, { -2.0f,  0xffff5a3a },
+                                      { -0.5f,  0xffff2d2d } };
+
+        if (db <= stops[0].db)
+            return juce::Colour (stops[0].argb);
+
+        for (int i = 1; i < 7; ++i)
+        {
+            if (db <= stops[i].db)
+            {
+                const float t = (db - stops[i - 1].db) / (stops[i].db - stops[i - 1].db);
+                return juce::Colour (stops[i - 1].argb).interpolatedWith (juce::Colour (stops[i].argb), t);
+            }
+        }
+
+        return juce::Colour (stops[6].argb);
+    }
+
     juce::String meterText (float value)
     {
         if (value <= -70.0f)
@@ -536,6 +559,12 @@ juce::Rectangle<int> SpectrumAnalyzerEditor::getResetRect() const
     return juce::Rectangle<int> (inner.getRight() - 46, inner.getY(), 46, 16);
 }
 
+juce::Rectangle<int> SpectrumAnalyzerEditor::getClipRect() const
+{
+    const auto reset = getResetRect();
+    return juce::Rectangle<int> (reset.getX() - 8 - 64, reset.getY(), 64, 16);
+}
+
 void SpectrumAnalyzerEditor::resized()
 {
     settingsButton.setBounds (getWidth() - 116, 4, 106, 26);
@@ -680,7 +709,8 @@ void SpectrumAnalyzerEditor::mouseMove (const juce::MouseEvent& e)
     const bool overLegend = s.showAnalyzer.load() && s.stereoMode.load() != 0
                             && (legendA.contains (e.getPosition()) || legendB.contains (e.getPosition()));
 
-    const bool overReset = s.showLoudness.load() && getResetRect().contains (e.getPosition());
+    const bool overReset = s.showLoudness.load()
+                           && (getResetRect().contains (e.getPosition()) || getClipRect().contains (e.getPosition()));
 
     setMouseCursor ((overLegend || overReset) ? juce::MouseCursor::PointingHandCursor
                                               : (hoverActive ? juce::MouseCursor::CrosshairCursor
@@ -707,6 +737,13 @@ void SpectrumAnalyzerEditor::mouseDown (const juce::MouseEvent& e)
     if (s.showLoudness.load() && getResetRect().contains (e.getPosition()))
     {
         audioProcessor.resetLoudnessRequested = true;
+        return;
+    }
+
+    // loudness meters: clicking the CLIP lamp clears only the clip counter
+    if (s.showLoudness.load() && getClipRect().contains (e.getPosition()))
+    {
+        audioProcessor.resetClipRequested = true;
         return;
     }
 
@@ -953,6 +990,42 @@ void SpectrumAnalyzerEditor::timerCallback()
                 }
             }
         }
+    }
+
+    // 6. meters: live peak, peak-hold markers and the clipping flash
+    if (settings.showLoudness.load())
+    {
+        const float peakLinear = audioProcessor.peakSincePoll.exchange (0.0f);
+        const float peakDb = peakLinear > 1.0e-6f ? 20.0f * std::log10 (peakLinear) : -120.0f;
+        meterPeakLive = (peakDb >= meterPeakLive) ? peakDb : std::max (peakDb, meterPeakLive - 1.5f);
+
+        const float levels[4] = { audioProcessor.loudnessMomentary.load(), audioProcessor.loudnessShortTerm.load(),
+                                  audioProcessor.loudnessIntegrated.load(), meterPeakLive };
+
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (levels[i] >= meterHold[i])
+            {
+                meterHold[i] = levels[i];
+                meterHoldFrames[i] = 45;                                    // hold for 1.5 s
+            }
+            else if (meterHoldFrames[i] > 0)
+            {
+                --meterHoldFrames[i];
+            }
+            else
+            {
+                meterHold[i] = std::max (levels[i], meterHold[i] - 0.5f);   // then fall slowly
+            }
+        }
+
+        const uint32_t clips = audioProcessor.clipCount.load();
+        if (clips > lastClipCount)
+            clipFlashFrames = 24;                                           // flash for about 0.8 s
+        lastClipCount = clips;
+
+        if (clipFlashFrames > 0)
+            --clipFlashFrames;
     }
 
     repaint();
@@ -1373,37 +1446,76 @@ void SpectrumAnalyzerEditor::drawScope (juce::Graphics& g, juce::Rectangle<float
 void SpectrumAnalyzerEditor::drawMeters (juce::Graphics& g, juce::Rectangle<float> area)
 {
     const auto& s = audioProcessor.settings;
+    const juce::Colour red (0xffff2d2d);
 
-    g.setColour (juce::Colours::white.withAlpha (0.04f));
-    g.fillRoundedRectangle (area, 8.0f);
-    g.setColour (juce::Colours::white.withAlpha (0.10f));
-    g.drawRoundedRectangle (area, 8.0f, 1.0f);
+    const uint32_t clips = audioProcessor.clipCount.load();
+    const bool clipped = clips > 0;
+    const float flash = (float) clipFlashFrames / 24.0f;      // 1 right after a new clip, then fades out
+
+    // card: soft glass look, the border glows red when the signal clips
+    if (flash > 0.0f)
+    {
+        g.setColour (red.withAlpha (0.14f * flash));
+        g.fillRoundedRectangle (area.expanded (3.0f), 13.0f);
+    }
+
+    g.setGradientFill (juce::ColourGradient (juce::Colours::white.withAlpha (0.07f), 0.0f, area.getY(),
+                                             juce::Colours::white.withAlpha (0.02f), 0.0f, area.getBottom(), false));
+    g.fillRoundedRectangle (area, 10.0f);
+
+    g.setColour (flash > 0.0f ? red.withAlpha (0.35f + 0.65f * flash) : juce::Colours::white.withAlpha (0.10f));
+    g.drawRoundedRectangle (area, 10.0f, flash > 0.0f ? 1.6f : 1.0f);
 
     auto inner = area.toNearestInt().reduced (12, 10);
 
-    // header: title and Reset
+    // header: title, CLIP lamp and Reset
     auto header = inner.removeFromTop (16);
     g.setFont (11.0f);
-    g.setColour (juce::Colours::white.withAlpha (0.45f));
+    g.setColour (juce::Colours::white.withAlpha (0.5f));
     g.drawText ("LOUDNESS", header, juce::Justification::centredLeft);
+
+    const auto lamp = getClipRect().toFloat();
+
+    if (clipped)
+    {
+        g.setColour (red.withAlpha (0.20f + 0.40f * flash));
+        g.fillRoundedRectangle (lamp.expanded (3.0f), 7.0f);
+        g.setColour (red.withAlpha (0.9f));
+        g.fillRoundedRectangle (lamp, 4.0f);
+        g.setColour (juce::Colours::white);
+        g.setFont (10.0f);
+        g.drawText ("CLIP " + (clips > 999 ? juce::String (">999") : juce::String ((int) clips)),
+                    lamp.toNearestInt(), juce::Justification::centred);
+    }
+    else
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.06f));
+        g.fillRoundedRectangle (lamp, 4.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.35f));
+        g.setFont (10.0f);
+        g.drawText ("CLIP", lamp.toNearestInt(), juce::Justification::centred);
+    }
 
     const auto resetRect = getResetRect();
     g.setColour (juce::Colours::white.withAlpha (0.12f));
     g.fillRoundedRectangle (resetRect.toFloat(), 4.0f);
     g.setColour (juce::Colours::white.withAlpha (0.8f));
+    g.setFont (10.0f);
     g.drawText ("Reset", resetRect, juce::Justification::centred);
 
-    inner.removeFromTop (8);
+    inner.removeFromTop (10);
 
-    const float peak = audioProcessor.samplePeakDb.load();
-    const float values[4] = { audioProcessor.loudnessMomentary.load(), audioProcessor.loudnessShortTerm.load(),
-                              audioProcessor.loudnessIntegrated.load(), peak };
+    // what to show: bars move live; the numbers are the measured values (peak: highest since Reset)
+    const float samplePeak = audioProcessor.samplePeakDb.load();
+    const float barValues[4] = { audioProcessor.loudnessMomentary.load(), audioProcessor.loudnessShortTerm.load(),
+                                 audioProcessor.loudnessIntegrated.load(), meterPeakLive };
+    const float textValues[4] = { barValues[0], barValues[1], barValues[2], samplePeak };
     const char* names[4] = { "MOM", "SHORT", "INT", "PEAK" };
     const char* units[4] = { "LUFS", "LUFS", "LUFS", "dBFS" };
 
-    auto footer = inner.removeFromBottom (28);
-    auto valuesRow = inner.removeFromTop (16);
-    inner.removeFromTop (4);
+    auto footer = inner.removeFromBottom (30);
+    auto valuesRow = inner.removeFromTop (18);
+    inner.removeFromTop (6);
     inner.removeFromBottom (4);
 
     const auto scaleArea = inner.removeFromLeft (26);
@@ -1412,77 +1524,103 @@ void SpectrumAnalyzerEditor::drawMeters (juce::Graphics& g, juce::Rectangle<floa
     const float barHeight = (float) inner.getHeight();
     const float barBottom = barTop + barHeight;
 
-    // scale marks
-    const float marks[] = { 0.0f, -12.0f, -24.0f, -36.0f, -48.0f };
-    g.setFont (10.0f);
-    for (float mark : marks)
+    // scale: a tick every 6 dB, a number every 12 dB
+    for (int mark = 0; mark >= -48; mark -= 6)
     {
-        const float y = barBottom - (mark - meterMinDb) / (0.0f - meterMinDb) * barHeight;
-        g.setColour (juce::Colours::white.withAlpha (0.07f));
+        const float y = barBottom - ((float) mark - meterMinDb) / (0.0f - meterMinDb) * barHeight;
+        const bool major = (mark % 12 == 0);
+
+        g.setColour (juce::Colours::white.withAlpha (major ? 0.10f : 0.05f));
         g.drawHorizontalLine ((int) y, (float) inner.getX(), (float) inner.getRight());
-        g.setColour (juce::Colours::white.withAlpha (0.45f));
-        g.drawText (juce::String ((int) mark), juce::Rectangle<int> (scaleArea.getX(), (int) y - 6, scaleArea.getWidth() - 4, 12),
-                    juce::Justification::centredRight);
+
+        if (major)
+        {
+            g.setFont (10.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.5f));
+            g.drawText (juce::String (mark), juce::Rectangle<int> (scaleArea.getX(), (int) y - 6, scaleArea.getWidth() - 4, 12),
+                        juce::Justification::centredRight);
+        }
     }
+
+    // segments: the bar is made of small blocks that light up one by one
+    const int segments = juce::jlimit (20, 48, (int) (barHeight / 6.0f));
+    const float segmentDb = (0.0f - meterMinDb) / (float) segments;
+    const float segmentHeight = barHeight / (float) segments;
+    const float gap = juce::jmax (1.0f, segmentHeight * 0.24f);
 
     for (int i = 0; i < 4; ++i)
     {
         const int columnX = inner.getX() + i * columnWidth;
         const float centreX = (float) columnX + (float) columnWidth * 0.5f;
-        const juce::Rectangle<float> bar (centreX - 10.0f, barTop, 20.0f, barHeight);
+        const juce::Rectangle<float> bar (centreX - 11.0f, barTop, 22.0f, barHeight);
+        const float value = barValues[i];
+        const bool peakColumn = (i == 3);
+        const bool columnClipping = peakColumn && clipped;
 
-        // track
-        g.setColour (juce::Colours::white.withAlpha (0.07f));
-        g.fillRoundedRectangle (bar, 3.0f);
-
-        // level
-        const float value = values[i];
-        const float fraction = (value <= -70.0f) ? 0.0f
-                                                 : (juce::jlimit (meterMinDb, 0.0f, value) - meterMinDb) / (0.0f - meterMinDb);
-
-        if (fraction > 0.0f)
+        // red glow around the peak bar right after a clip
+        if (peakColumn && flash > 0.0f)
         {
-            const juce::Rectangle<float> fill (bar.getX(), bar.getBottom() - bar.getHeight() * fraction,
-                                               bar.getWidth(), bar.getHeight() * fraction);
-
-            if (s.meterMode.load() == 0)
-            {
-                // gradient fixed along the whole bar: green at the bottom, red near 0 (headroom / clipping)
-                juce::ColourGradient grad (juce::Colour (0xffff3b3b), 0.0f, bar.getY(),
-                                           juce::Colour (0xff3ddc84), 0.0f, bar.getBottom(), false);
-                grad.addColour (0.07, juce::Colour (0xffff5a3a));
-                grad.addColour (0.15, juce::Colour (0xffff9a3c));
-                grad.addColour (0.30, juce::Colour (0xffffd84a));
-                grad.addColour (0.50, juce::Colour (0xffb4e04a));
-                g.setGradientFill (grad);
-            }
-            else
-            {
-                g.setColour (juce::Colour (s.meterColour.load()));
-            }
-
-            g.fillRoundedRectangle (fill, 3.0f);
+            g.setColour (red.withAlpha (0.28f * flash));
+            g.fillRoundedRectangle (bar.expanded (6.0f, 4.0f), 7.0f);
         }
 
-        // clip indicator above the peak bar
-        const bool clipping = (i == 3 && peak >= -0.1f);
-        if (clipping)
+        for (int seg = 0; seg < segments; ++seg)
         {
-            g.setColour (juce::Colour (0xffff3b3b));
-            g.fillRoundedRectangle (bar.getX(), bar.getY() - 4.0f, bar.getWidth(), 3.0f, 1.5f);
+            const float segCentreDb = meterMinDb + ((float) seg + 0.5f) * segmentDb;
+            const float y = barBottom - (float) (seg + 1) * segmentHeight;
+            const juce::Rectangle<float> block (bar.getX(), y + gap * 0.5f, bar.getWidth(), segmentHeight - gap);
+            const bool lit = (value > -70.0f) && (value >= segCentreDb);
+
+            if (! lit)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.07f));
+                g.fillRoundedRectangle (block, 1.5f);
+                continue;
+            }
+
+            // gradient: green -> red. Solid: the chosen colour, but the top segments are always red
+            juce::Colour colour = (s.meterMode.load() == 0) ? colourForDb (segCentreDb)
+                                                            : juce::Colour (s.meterColour.load());
+            if (segCentreDb >= -1.0f)
+                colour = red;
+
+            g.setColour (colour.withAlpha (0.20f));
+            g.fillRoundedRectangle (block.expanded (2.5f, 1.0f), 3.0f);     // glow
+            g.setColour (colour);
+            g.fillRoundedRectangle (block, 1.5f);
+        }
+
+        // peak-hold marker (not for the integrated value, which moves slowly)
+        if (i != 2 && meterHold[(size_t) i] > value + 0.5f && meterHold[(size_t) i] > meterMinDb)
+        {
+            const float level = juce::jlimit (meterMinDb, 0.0f, meterHold[(size_t) i]);
+            const float y = barBottom - (level - meterMinDb) / (0.0f - meterMinDb) * barHeight;
+
+            g.setColour ((level >= -0.5f ? red : juce::Colours::white).withAlpha (0.95f));
+            g.fillRoundedRectangle (bar.getX() - 3.0f, y - 1.0f, bar.getWidth() + 6.0f, 2.0f, 1.0f);
+        }
+
+        // clip bar above the peak meter: lit while clipped
+        if (columnClipping)
+        {
+            g.setColour (red.withAlpha (0.35f));
+            g.fillRoundedRectangle (bar.getX() - 2.0f, bar.getY() - 7.0f, bar.getWidth() + 4.0f, 6.0f, 3.0f);
+            g.setColour (red);
+            g.fillRoundedRectangle (bar.getX(), bar.getY() - 6.0f, bar.getWidth(), 4.0f, 2.0f);
         }
 
         // value, name and unit
-        g.setFont (12.0f);
-        g.setColour (clipping ? juce::Colour (0xffff5a5a) : juce::Colours::white);
-        g.drawText (meterText (value), juce::Rectangle<int> (columnX, valuesRow.getY(), columnWidth, 16),
+        g.setFont (13.0f);
+        g.setColour (columnClipping ? juce::Colour (0xffff5a5a) : juce::Colours::white);
+        g.drawText (meterText (textValues[i]), juce::Rectangle<int> (columnX, valuesRow.getY(), columnWidth, 18),
                     juce::Justification::centred);
 
         g.setFont (10.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.6f));
+        g.setColour (columnClipping ? juce::Colour (0xffff5a5a) : juce::Colours::white.withAlpha (0.7f));
         g.drawText (names[i], juce::Rectangle<int> (columnX, footer.getY(), columnWidth, 14), juce::Justification::centred);
+        g.setFont (9.0f);
         g.setColour (juce::Colours::white.withAlpha (0.35f));
-        g.drawText (units[i], juce::Rectangle<int> (columnX, footer.getY() + 13, columnWidth, 13), juce::Justification::centred);
+        g.drawText (units[i], juce::Rectangle<int> (columnX, footer.getY() + 14, columnWidth, 13), juce::Justification::centred);
     }
 }
 

@@ -114,6 +114,8 @@ void SpectrumAnalyzerProcessor::resetLoudnessState()
     loudnessShortTerm  = -120.0f;
     loudnessIntegrated = -120.0f;
     samplePeakDb       = -120.0f;
+    peakSincePoll      = 0.0f;
+    clipCount          = 0;
 }
 
 // Called every 100 ms: updates momentary, short-term and integrated loudness
@@ -198,6 +200,9 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 
     if (resetLoudnessRequested.exchange (false))
         resetLoudnessState();
+
+    if (resetClipRequested.exchange (false))
+        clipCount = 0;
 
     const float* left  = mainBuffer.getReadPointer (0);
     const float* right = numChannels > 1 ? mainBuffer.getReadPointer (1) : left;
@@ -311,6 +316,8 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 
     // Loudness: K-weighting, then the energy is collected in 100 ms blocks
     const int measuredChannels = (numChannels > 1) ? 2 : 1;
+    double blockPeak = 0.0;
+    uint32_t blockClips = 0;
 
     for (int i = 0; i < numSamples; ++i)
     {
@@ -320,6 +327,10 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
         {
             const double x = (double) (ch == 0 ? left[i] : right[i]);
             peakLinear = juce::jmax (peakLinear, std::abs (x));
+            blockPeak = juce::jmax (blockPeak, std::abs (x));
+
+            if (std::abs (x) >= 0.99999)
+                ++blockClips;
 
             const double k = kHighPass[ch].process (kShelf[ch].process (x));
             energy += k * k;
@@ -330,6 +341,12 @@ void SpectrumAnalyzerProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
         if (++subBlockCount >= subBlockLength)
             finishSubBlock();
     }
+
+    if (blockClips > 0)
+        clipCount.fetch_add (blockClips, std::memory_order_relaxed);
+
+    if ((float) blockPeak > peakSincePoll.load (std::memory_order_relaxed))
+        peakSincePoll.store ((float) blockPeak, std::memory_order_relaxed);
 
     samplePeakDb.store (peakLinear > 1.0e-6 ? (float) (20.0 * std::log10 (peakLinear)) : -120.0f);
 }

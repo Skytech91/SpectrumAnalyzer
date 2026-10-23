@@ -222,6 +222,7 @@ private:
     juce::Rectangle<float> getScopeBounds() const;
     juce::Rectangle<float> getMetersBounds() const;
     juce::Rectangle<int> getResetRect() const;
+    juce::Rectangle<int> getClipRect() const;
 
     void drawAnalyzer (juce::Graphics& g);
     void drawScope (juce::Graphics& g, juce::Rectangle<float> area);
@@ -279,6 +280,13 @@ private:
     bool showA = true, showB = true;
 
     float hueOffset = 0.0f;
+
+    // meters: live peak, peak-hold markers and the clipping flash
+    std::array<float, 4> meterHold { { -120.0f, -120.0f, -120.0f, -120.0f } };
+    std::array<int, 4> meterHoldFrames { { 0, 0, 0, 0 } };
+    float meterPeakLive = -120.0f;
+    uint32_t lastClipCount = 0;
+    int clipFlashFrames = 0;
 
     // mouse position
     juce::Point<float> hoverPos;

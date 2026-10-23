@@ -120,6 +120,9 @@ public:
     std::atomic<float> loudnessIntegrated { -120.0f };    // LUFS, gated, since the last reset
     std::atomic<float> samplePeakDb       { -120.0f };    // dBFS, highest sample since the last reset
     std::atomic<bool>  resetLoudnessRequested { false };
+    std::atomic<float> peakSincePoll { 0.0f };            // linear peak since the interface last asked
+    std::atomic<uint32_t> clipCount { 0 };                // samples at or above 0 dBFS since the last reset
+    std::atomic<bool>  resetClipRequested { false };
 
     // Visual settings (changed in the interface, saved with the project)
     struct Settings
